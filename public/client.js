@@ -1,10 +1,10 @@
-
 // public/client.js
 
 const $ = (id) => document.getElementById(id);
 
 const state = {
   ws: null,
+  kicked: false,
   roomCode: null,
   clientToken: localStorage.getItem('beiguo_clientToken') || null,
   nick: localStorage.getItem('beiguo_nick') || '',
@@ -133,6 +133,16 @@ function startWs() {
         return;
       }
 
+      if (msg.type === 'KICKED') {
+        toast(msg.message || '你已被移出房间');
+        // 回到加入界面（保留昵称/本地 token，允许再次加入）
+        state.kicked = true;
+        state.snapshot = null;
+        state.roomCode = null;
+        setMode('join');
+        return;
+      }
+
       if (msg.type === 'ROOM_CREATED' || msg.type === 'ROOM_JOINED') {
         state.roomCode = msg.roomCode;
         state.clientToken = msg.clientToken;
@@ -153,6 +163,10 @@ function startWs() {
     ws.onclose = () => {
       const el = document.getElementById('connStatus');
       if (el) el.textContent = '未连接';
+      if (state.kicked) {
+        state.kicked = false;
+        return;
+      }
       toast('连接已断开，正在尝试重连…');
       scheduleReconnect();
     };
@@ -283,6 +297,15 @@ function renderRoster(roster) {
           send('HOST_TRANSFER', { targetToken: row.token });
         };
         opsWrap.appendChild(transferBtn);
+
+        const kickBtn = document.createElement('button');
+        kickBtn.className = 'danger smallBtn';
+        kickBtn.textContent = '踢出';
+        kickBtn.onclick = () => {
+          if (!confirm(`确定踢出 ${row.nick}？`)) return;
+          send('KICK_MEMBER', { targetToken: row.token });
+        };
+        opsWrap.appendChild(kickBtn);
       }
 
       tdOps.appendChild(opsWrap);
