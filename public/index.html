@@ -100,6 +100,24 @@
       .rosterSelect{width:100%}
     }
     .toast{position:fixed;right:12px;bottom:12px;max-width:420px;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;display:none}
+
+    /* Game over modal */
+    .modalOverlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(17,24,39,.55);backdrop-filter:blur(2px);z-index:50}
+    .modalOverlay.show{display:flex}
+    .modalWindow{width:min(620px,100%);border-radius:16px;border:1px solid rgba(255,255,255,.18);box-shadow:0 14px 45px rgba(0,0,0,.25);overflow:hidden}
+    .modalHead{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;background:rgba(255,255,255,.14);color:#fff}
+    .modalTitle{font-weight:900;letter-spacing:.3px}
+    .modalClose{border:1px solid rgba(255,255,255,.22);background:rgba(0,0,0,.15);color:#fff;border-radius:12px;padding:6px 10px;font-size:13px}
+    .modalBody{padding:14px 16px;color:#fff;font-size:15px;line-height:1.45;white-space:pre-wrap}
+    .modalWindow.win{background:radial-gradient(1200px 300px at 10% 0%, rgba(16,185,129,.55), transparent),
+                      radial-gradient(900px 300px at 90% 10%, rgba(34,197,94,.45), transparent),
+                      linear-gradient(135deg, rgba(6,95,70,.95), rgba(17,24,39,.95));}
+    .modalWindow.lose{background:radial-gradient(1200px 300px at 10% 0%, rgba(244,63,94,.45), transparent),
+                       radial-gradient(900px 300px at 90% 10%, rgba(245,158,11,.28), transparent),
+                       linear-gradient(135deg, rgba(127,29,29,.95), rgba(17,24,39,.95));}
+    .modalWindow.draw{background:radial-gradient(1000px 300px at 15% 0%, rgba(59,130,246,.35), transparent),
+                       radial-gradient(900px 300px at 90% 10%, rgba(168,85,247,.25), transparent),
+                       linear-gradient(135deg, rgba(17,24,39,.98), rgba(15,23,42,.98));}
 </style>
   <!-- 简繁转换（OpenCC-JS, UMD） -->
   <script src="https://cdn.jsdelivr.net/npm/opencc-js@1.0.5/dist/umd/full.js"></script>
@@ -114,6 +132,7 @@
           <option value="zh-CN">简体</option>
           <option value="zh-TW">繁體</option>
         </select>
+        <span id="godToggleWrap"></span>
       </div>
     </div>
 
@@ -146,7 +165,7 @@
             <span class="pill" id="selfTag"></span>
           </div>
           <div class="muted" style="margin-top:6px">若刷新页面，系统会用本地 token 尝试重连占座。</div>
-          <div id="gameOverBox" style="display:none;padding:12px;margin-top:10px;border-radius:10px;background:#300;color:#fff;font-size:16px;text-align:center;"></div>
+          <div id="gameOverBox" style="display:none"></div>
         </div>
         <div>
           <div class="toolbar" style="justify-content:flex-end">
@@ -188,6 +207,17 @@
     </div>
 
     <div class="toast" id="toast"></div>
+
+    <!-- Game over modal -->
+    <div class="modalOverlay" id="gameOverModal" aria-hidden="true">
+      <div class="modalWindow" id="gameOverModalWin" role="dialog" aria-modal="true">
+        <div class="modalHead">
+          <div class="modalTitle" id="gameOverModalTitle">游戏结束</div>
+          <button class="modalClose" id="gameOverModalClose">关闭</button>
+        </div>
+        <div class="modalBody" id="gameOverModalBody"></div>
+      </div>
+    </div>
   </div>
 
   <script src="client.js"></script>
