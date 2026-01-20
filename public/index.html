@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>北国密令 · 联机版</title>
+  <style>
+    :root{
+      --c-bg:#fafafa;
+      --c-card:#fff;
+      --c-border:#e5e7eb;
+      --c-text:#111;
+      --c-muted:#6b7280;
+      --c-a:#2563eb;
+      --c-b:#dc2626;
+      --c-deploy:#0ea5e9;
+      --c-chase:#f59e0b;
+      --c-ok:#10b981;
+      --c-warn:#f97316;
+      --c-dark:#111827;
+    }
+    *{box-sizing:border-box}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:var(--c-bg);color:var(--c-text)}
+    .wrap{max-width:1200px;margin:0 auto;padding:16px}
+    h1{font-size:20px;margin:0 0 12px}
+    .card{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:12px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    .row>div{flex:1;min-width:260px}
+    label{font-size:12px;color:#555;display:block;margin-bottom:4px}
+    input{width:100%;padding:10px;border:1px solid #d1d5db;border-radius:8px;font-size:14px}
+    button{padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;background:#f9fafb;cursor:pointer;font-size:14px}
+    button.primary{background:#111827;color:#fff;border-color:#111827}
+    button.danger{background:#fee2e2;border-color:#fecaca}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .muted{color:#6b7280;font-size:12px}
+    .pill{display:inline-block;padding:2px 8px;border:1px solid var(--c-border);border-radius:999px;font-size:12px;background:#f9fafb}
+    .pill.a{border-color:rgba(37,99,235,.35);background:rgba(37,99,235,.08);color:var(--c-a)}
+    .pill.b{border-color:rgba(220,38,38,.35);background:rgba(220,38,38,.08);color:var(--c-b)}
+    .pill.phaseDeploy{border-color:rgba(14,165,233,.45);background:rgba(14,165,233,.10);color:var(--c-deploy)}
+    .pill.phaseChase{border-color:rgba(245,158,11,.45);background:rgba(245,158,11,.12);color:var(--c-chase)}
+
+    .phaseBanner{margin-top:10px;border:1px solid var(--c-border);border-radius:12px;padding:10px 12px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+    .phaseBanner .big{font-size:18px;font-weight:800;letter-spacing:.5px}
+    .phaseBanner.deploy{border-color:rgba(14,165,233,.35);background:rgba(14,165,233,.06)}
+    .phaseBanner.chase{border-color:rgba(245,158,11,.35);background:rgba(245,158,11,.08)}
+    .grid{display:grid;grid-template-columns:repeat(3,64px);gap:6px}
+    .boardWrap{position:relative;display:inline-block;padding:18px}
+    .dirLabel{position:absolute;font-size:11px;color:#6b7280;user-select:none}
+    .dirN{top:2px;left:50%;transform:translateX(-50%)}
+    .dirS{bottom:2px;left:50%;transform:translateX(-50%)}
+    .dirW{left:2px;top:50%;transform:translateY(-50%)}
+    .dirE{right:2px;top:50%;transform:translateY(-50%)}
+    .dirNW{top:2px;left:2px}
+    .dirNE{top:2px;right:2px}
+    .dirSW{bottom:2px;left:2px}
+    .dirSE{bottom:2px;right:2px}
+    .cell{width:64px;height:64px;border:1px solid #d1d5db;border-radius:8px;display:flex;align-items:center;justify-content:center;flex-direction:column;background:#fff;cursor:pointer;user-select:none}
+    .cell small{font-size:11px;color:#6b7280}
+    .cell.legal{outline:2px solid #10b981}
+    .cell.pending{outline:3px solid #111827}
+    .cell.outerVisited{box-shadow:inset 0 0 0 3px rgba(37,99,235,.35)}
+
+    .piece{font-weight:700;font-size:14px}
+    .boards{display:flex;gap:16px;flex-wrap:wrap}
+    .boards.refGrid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    @media (max-width: 980px){
+      .boards.refGrid{grid-template-columns:1fr}
+    }
+    .boardBox{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:10px}
+    .boardTitle{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+    .roomLayout{display:grid;grid-template-columns:420px 1fr;gap:12px;align-items:start}
+    @media (max-width: 980px){
+      .roomLayout{grid-template-columns:1fr}
+    }
+    .sidebar{display:flex;flex-direction:column;gap:12px;position:sticky;top:12px;max-height:calc(100vh - 24px)}
+    @media (max-width: 980px){
+      .sidebar{position:static;max-height:none}
+    }
+    .rosterWrap{border:1px solid #e5e7eb;border-radius:10px;overflow:auto;max-height:220px}
+    .logWrap{border:1px solid #e5e7eb;border-radius:10px;overflow:auto;max-height:calc(100vh - 420px);background:#fcfcfc;padding:10px}
+    @media (max-width: 980px){
+      .logWrap{max-height:260px}
+    }
+    .log{border:1px solid #e5e7eb;border-radius:10px;padding:10px;background:#fcfcfc;max-height:260px;overflow:auto;font-size:12px}
+    .logLine{display:flex;gap:8px;align-items:flex-start;margin:0 0 6px;line-height:1.25}
+    .logTag{flex:0 0 auto;font-size:11px;border-radius:999px;padding:1px 8px;border:1px solid var(--c-border);background:#fff;color:#374151}
+    .logTag.deploy{border-color:rgba(14,165,233,.35);background:rgba(14,165,233,.06);color:var(--c-deploy)}
+    .logTag.chase{border-color:rgba(245,158,11,.35);background:rgba(245,158,11,.08);color:var(--c-chase)}
+    .logTag.card{border-color:rgba(17,24,39,.25);background:rgba(17,24,39,.04);color:var(--c-dark)}
+    .logTag.hidden{border-color:rgba(249,115,22,.35);background:rgba(249,115,22,.08);color:var(--c-warn)}
+    .logTag.win{border-color:rgba(16,185,129,.35);background:rgba(16,185,129,.08);color:var(--c-ok)}
+    .toolbar{display:flex;gap:8px;flex-wrap:wrap}
+    .roster{width:100%;border-collapse:collapse;font-size:13px}
+    .roster th,.roster td{border-top:1px solid #eee;padding:6px;text-align:left;vertical-align:top}
+    /* Host roster compact controls */
+    .rosterOps{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+    .rosterSelect{height:30px;padding:4px 8px;border:1px solid #e5e7eb;border-radius:10px;background:#fff;font-size:12px}
+    .smallBtn{padding:6px 10px;font-size:12px;border-radius:10px}
+    @media (max-width: 980px){
+      .rosterSelect{width:100%}
+    }
+    .toast{position:fixed;right:12px;bottom:12px;max-width:420px;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;display:none}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>北国密令 · 联机版</h1>
+
+    <div class="card" id="joinCard">
+      <div class="row">
+        <div>
+          <label>临时昵称</label>
+          <input id="nickInput" placeholder="例如：Tim" />
+          <div class="muted">昵称会用于房主分配席位（A/B/裁判）。</div>
+        </div>
+        <div>
+          <label>房间号（加入用）</label>
+          <input id="roomInput" placeholder="例如：ABCD12" />
+          <div class="muted">创建房间会自动生成房间号。</div>
+        </div>
+      </div>
+      <div class="toolbar" style="margin-top:10px">
+        <button class="primary" id="btnCreate">创建房间</button>
+        <button id="btnJoin">加入房间</button>
+        <span class="muted" id="connStatus">未连接</span>
+      </div>
+    </div>
+
+    <div class="card" id="roomCard" style="display:none">
+      <div class="row">
+        <div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <div><b>房间号：</b><span id="roomCode"></span></div>
+            <button id="btnCopy">复制邀请链接</button>
+            <span class="pill" id="selfTag"></span>
+          </div>
+          <div class="muted" style="margin-top:6px">若刷新页面，系统会用本地 token 尝试重连占座。</div>
+          <div id="gameOverBox" style="display:none;padding:12px;margin-top:10px;border-radius:10px;background:#300;color:#fff;font-size:16px;text-align:center;"></div>
+        </div>
+        <div>
+          <div class="toolbar" style="justify-content:flex-end">
+            <button class="primary" id="btnStart">开始/重置游戏（裁判）</button>
+            <button id="btnAdvance">下一阶段（裁判）</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="roomLayout" style="margin-top:12px">
+        <div class="sidebar">
+          <div class="card" style="margin:0">
+            <h3 style="margin:0 0 8px;font-size:14px">在线列表（房主可分配席位 / 转移房主）</h3>
+            <div class="rosterWrap">
+              <table class="roster" id="rosterTable">
+                <thead>
+                  <tr>
+                    <th>昵称</th>
+                    <th>当前身份</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <div class="muted" style="margin-top:6px">说明：转移房主 = 指定对方为裁判并接管管理权限（你将失去房主权限）。</div>
+          </div>
+
+          <div class="card" style="margin:0">
+            <strong id="logTitle">日志</strong>
+            <div style="margin-top:8px" id="logPanel" class="logWrap"></div>
+          </div>
+        </div>
+
+        <div>
+          <div id="viewRoot"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+  </div>
+
+  <script src="client.js"></script>
+</body>
+</html>
