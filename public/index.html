@@ -100,18 +100,29 @@
       .rosterSelect{width:100%}
     }
     .toast{position:fixed;right:12px;bottom:12px;max-width:420px;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;display:none}
-  </style>
+</style>
+  <!-- 简繁转换（OpenCC-JS, UMD） -->
+  <script src="https://cdn.jsdelivr.net/npm/opencc-js@1.0.5/dist/umd/full.js"></script>
 </head>
 <body>
   <div class="wrap">
-    <h1>北国密令 · 联机版</h1>
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+      <h1 style="margin:0">北国密令 · 联机版</h1>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="muted">语言</span>
+        <select id="langSelect" class="rosterSelect" style="height:34px">
+          <option value="zh-CN">简体</option>
+          <option value="zh-TW">繁體</option>
+        </select>
+      </div>
+    </div>
 
     <div class="card" id="joinCard">
       <div class="row">
         <div>
           <label>临时昵称</label>
           <input id="nickInput" placeholder="例如：玉玉" />
-          <div class="muted">昵称会用于房主分配席位（A/B/裁判）。</div>
+          <div class="muted">昵称会用于房主分配席位（大宋/契丹/裁判/观众）。</div>
         </div>
         <div>
           <label>房间号（加入用）</label>
