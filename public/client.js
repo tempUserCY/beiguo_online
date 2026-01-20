@@ -9,8 +9,139 @@ const state = {
   clientToken: localStorage.getItem('beiguo_clientToken') || null,
   nick: localStorage.getItem('beiguo_nick') || '',
   snapshot: null,
-  pendingMove: null
+  pendingMove: null,
+
+  // i18n
+  lang: localStorage.getItem('beiguo_lang') || 'zh-CN'
 };
+
+// --- 简体/繁体切换（基于 OpenCC-JS）---
+const i18n = {
+  converter: null,
+  textNodeOriginal: new WeakMap(),
+  trackedTextNodes: new Set(),
+  trackedAttrs: new Set() // elements with placeholder/title/data-i18n-* originals
+};
+
+function ensureOpenCC() {
+  if (!window.OpenCC) return null;
+  if (!i18n.converter) {
+    // 简体（大陆） -> 繁体（台湾）
+    i18n.converter = OpenCC.Converter({ from: 'cn', to: 'tw' });
+  }
+  return i18n.converter;
+}
+
+function applyLanguage() {
+  const lang = state.lang || 'zh-CN';
+  document.documentElement.lang = lang;
+
+  const toTrad = (lang === 'zh-TW' || lang === 'zh-Hant');
+  const converter = toTrad ? ensureOpenCC() : null;
+
+  // 1) Text nodes
+  //    - 转繁：保存原文 -> 转换
+  //    - 转简：恢复原文
+  const walker = document.createTreeWalker(
+    document.body,
+    NodeFilter.SHOW_TEXT,
+    {
+      acceptNode(node) {
+        if (!node || !node.parentElement) return NodeFilter.FILTER_REJECT;
+        const p = node.parentElement;
+        const tag = p.tagName;
+        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'TEXTAREA' || tag === 'INPUT') return NodeFilter.FILTER_REJECT;
+        const v = node.nodeValue;
+        if (!v || !v.trim()) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    },
+    false
+  );
+
+  let n;
+  while ((n = walker.nextNode())) {
+    // 只处理包含中文的节点（避免无意义处理）
+    const cur = n.nodeValue;
+    if (!/[\u4e00-\u9fff]/.test(cur)) continue;
+
+    if (toTrad) {
+      if (!converter) continue;
+      if (!i18n.textNodeOriginal.has(n)) {
+        i18n.textNodeOriginal.set(n, cur);
+        i18n.trackedTextNodes.add(n);
+      }
+      const orig = i18n.textNodeOriginal.get(n) || cur;
+      try {
+        n.nodeValue = converter(orig);
+      } catch {
+        // 如果 OpenCC 不可用/报错，就不转换
+      }
+    } else {
+      if (i18n.textNodeOriginal.has(n)) {
+        n.nodeValue = i18n.textNodeOriginal.get(n);
+      }
+    }
+  }
+
+  // 2) Common attrs: placeholder / title
+  const els = document.querySelectorAll('[placeholder],[title]');
+  els.forEach(el => {
+    if (!el || !el.getAttribute) return;
+
+    // placeholder
+    if (el.hasAttribute('placeholder')) {
+      const cur = el.getAttribute('placeholder') || '';
+      if (toTrad) {
+        if (!el.dataset.origPlaceholder) el.dataset.origPlaceholder = cur;
+        i18n.trackedAttrs.add(el);
+        if (converter && /[\u4e00-\u9fff]/.test(el.dataset.origPlaceholder || '')) {
+          try { el.setAttribute('placeholder', converter(el.dataset.origPlaceholder)); } catch {}
+        }
+      } else if (el.dataset.origPlaceholder) {
+        el.setAttribute('placeholder', el.dataset.origPlaceholder);
+      }
+    }
+
+    // title
+    if (el.hasAttribute('title')) {
+      const cur = el.getAttribute('title') || '';
+      if (toTrad) {
+        if (!el.dataset.origTitle) el.dataset.origTitle = cur;
+        i18n.trackedAttrs.add(el);
+        if (converter && /[\u4e00-\u9fff]/.test(el.dataset.origTitle || '')) {
+          try { el.setAttribute('title', converter(el.dataset.origTitle)); } catch {}
+        }
+      } else if (el.dataset.origTitle) {
+        el.setAttribute('title', el.dataset.origTitle);
+      }
+    }
+  });
+
+  // 3) Page title
+  if (toTrad && converter) {
+    if (!document.documentElement.dataset.origDocTitle) {
+      document.documentElement.dataset.origDocTitle = document.title;
+    }
+    try { document.title = converter(document.documentElement.dataset.origDocTitle); } catch {}
+  } else if (document.documentElement.dataset.origDocTitle) {
+    document.title = document.documentElement.dataset.origDocTitle;
+  }
+}
+
+function sideName(side) {
+  if (side === 'A') return '大宋';
+  if (side === 'B') return '契丹';
+  return String(side);
+}
+
+function roleName(role) {
+  if (role === 'A') return '大宋';
+  if (role === 'B') return '契丹';
+  if (role === 'REF') return '裁判';
+  if (role === 'SPECTATOR') return '观众';
+  return String(role);
+}
 
 function toast(msg) {
   const el = $('toast');
@@ -18,6 +149,9 @@ function toast(msg) {
   el.style.display = 'block';
   clearTimeout(toast._t);
   toast._t = setTimeout(() => { el.style.display = 'none'; }, 2600);
+
+  // toast 是独立浮层，确保语言切换后也正确显示
+  applyLanguage();
 }
 
 function getOverFromView(view) {
@@ -253,7 +387,7 @@ function renderRoster(roster) {
     tdNick.textContent = row.nick;
 
     const tdRole = document.createElement('td');
-    tdRole.textContent = row.role + (row.seat ? `(${row.seat})` : '');
+    tdRole.textContent = roleName(row.role);
 
     const tdOps = document.createElement('td');
 
@@ -265,8 +399,8 @@ function renderRoster(roster) {
       const sel = document.createElement('select');
       sel.className = 'rosterSelect';
       const options = [
-        { v: 'A', label: '设为A' },
-        { v: 'B', label: '设为B' },
+        { v: 'A', label: '设为大宋' },
+        { v: 'B', label: '设为契丹' },
         { v: 'REF', label: '设为裁判' },
         { v: 'SPECTATOR', label: '设为观众' },
       ];
@@ -483,7 +617,7 @@ function renderPlayerView(view) {
   banner.innerHTML = `
     <div class="big">回合 ${view.round} · ${phaseName}</div>
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-      <span class="pill ${view.side === 'A' ? 'a' : 'b'}">玩家 ${view.side}</span>
+      <span class="pill ${view.side === 'A' ? 'a' : 'b'}">${sideName(view.side)}</span>
       <span class="pill ${view.phase === 'deploy' ? 'phaseDeploy' : 'phaseChase'}">${view.phase === 'deploy' ? '间谍行动' : '追捕行动'}</span>
     </div>
   `;
@@ -494,13 +628,62 @@ function renderPlayerView(view) {
   hint.innerHTML = `<span class="pill">操作说明</span> 先点绿色合法格子进行<strong>预选</strong>（不入日志），再点<strong>确认落点</strong>提交。`;
   root.appendChild(hint);
 
+  // --- Buff 栏（玩家视角：只看自己的）---
+  const buffCard = document.createElement('div');
+  buffCard.className = 'card';
+  buffCard.style.marginTop = '10px';
+
+  const buffs = [];
+  if (view.self?.patrolActive && (view.self.patrolRoundsLeft || 0) > 0) {
+    buffs.push({ name: '差役成群', detail: `剩 ${view.self.patrolRoundsLeft} 回合` });
+  }
+  if ((view.self?.frozenRounds || 0) > 0) {
+    buffs.push({ name: '宵禁令', detail: `冻结 ${view.self.frozenRounds} 回合` });
+  }
+  if (view.self?.youjingPending) {
+    buffs.push({ name: '幽径暗道', detail: '待穿越（本回合）' });
+  }
+  if (view.self?.hidden?.almsNetwork) {
+    buffs.push({ name: '丐帮情报网络', detail: '永久' });
+  }
+  if (view.self?.hidden?.undergroundNetwork) {
+    buffs.push({ name: '地下网络', detail: '永久' });
+  }
+  if (view.self?.hidden?.hunterIntuition) {
+    buffs.push({ name: '猎户直觉', detail: '永久' });
+  }
+
+  buffCard.innerHTML = `<strong>你的 Buff</strong>`;
+  if (!buffs.length) {
+    const none = document.createElement('div');
+    none.className = 'muted';
+    none.style.marginTop = '6px';
+    none.textContent = '暂无持续效果';
+    buffCard.appendChild(none);
+  } else {
+    const bar = document.createElement('div');
+    bar.style.display = 'flex';
+    bar.style.flexWrap = 'wrap';
+    bar.style.gap = '6px';
+    bar.style.marginTop = '8px';
+
+    for (const b of buffs) {
+      const p = document.createElement('span');
+      p.className = 'pill';
+      p.textContent = `${b.name} · ${b.detail}`;
+      bar.appendChild(p);
+    }
+    buffCard.appendChild(bar);
+  }
+  root.appendChild(buffCard);
+
   const boardBox = document.createElement('div');
   boardBox.className = 'boardBox';
   boardBox.style.marginTop = '10px';
 
   const title = document.createElement('div');
   title.className = 'boardTitle';
-  title.innerHTML = `<strong>你的棋盘（${view.side}）</strong><span class="pill">${view.phase === 'deploy' ? '点格子移动间' : '点格子移动捕'}</span>`;
+  title.innerHTML = `<strong>你的棋盘（${sideName(view.side)}）</strong><span class="pill">${view.phase === 'deploy' ? '点格子移动间' : '点格子移动捕'}</span>`;
   boardBox.appendChild(title);
 
   const boardRoot = document.createElement('div');
@@ -766,7 +949,7 @@ function renderRefView(view) {
     box.className = 'boardBox';
     const title = document.createElement('div');
     title.className = 'boardTitle';
-    title.innerHTML = `<strong>${side} 方棋盘</strong><span class="pill">间/捕全可见</span>`;
+    title.innerHTML = `<strong>${sideName(side)} 方棋盘</strong><span class="pill">间/捕全可见</span>`;
     box.appendChild(title);
     const root = document.createElement('div');
     box.appendChild(root);
@@ -789,12 +972,57 @@ function renderRefView(view) {
   };
   stat.innerHTML = `
     <div><strong>状态</strong></div>
-    <div class="muted" style="margin-top:6px">A 冻结回合：${truth.A.frozenRounds}；B 冻结回合：${truth.B.frozenRounds}</div>
-    <div class="muted">A 本阶段移动次数：${truth.movesThisPhase.A}；B 本阶段移动次数：${truth.movesThisPhase.B}</div>
-    <div class="muted">A 本阶段已用锦囊：${truth.cardsUsedThisPhase.A ? '是' : '否'}；B：${truth.cardsUsedThisPhase.B ? '是' : '否'}</div>
-    <div style="margin-top:8px"><span class="pill">A 手牌</span> <span class="muted">${cardSummary('A')}</span></div>
-    <div style="margin-top:6px"><span class="pill">B 手牌</span> <span class="muted">${cardSummary('B')}</span></div>
+    <div class="muted" style="margin-top:6px">${sideName('A')} 冻结回合：${truth.A.frozenRounds}；${sideName('B')} 冻结回合：${truth.B.frozenRounds}</div>
+    <div class="muted">${sideName('A')} 本阶段移动次数：${truth.movesThisPhase.A}；${sideName('B')} 本阶段移动次数：${truth.movesThisPhase.B}</div>
+    <div class="muted">${sideName('A')} 本阶段已用锦囊：${truth.cardsUsedThisPhase.A ? '是' : '否'}；${sideName('B')}：${truth.cardsUsedThisPhase.B ? '是' : '否'}</div>
+    <div style="margin-top:8px"><span class="pill">${sideName('A')} 手牌</span> <span class="muted">${cardSummary('A')}</span></div>
+    <div style="margin-top:6px"><span class="pill">${sideName('B')} 手牌</span> <span class="muted">${cardSummary('B')}</span></div>
   `;
+
+  // --- Buff 栏（上帝视角：两边都可见）---
+  const mkBuffLine = (side) => {
+    const p = truth[side];
+    const buffs = [];
+    if (p.patrolActive && (p.patrolRoundsLeft || 0) > 0) buffs.push(`差役成群 · 剩 ${p.patrolRoundsLeft} 回合`);
+    if ((p.frozenRounds || 0) > 0) buffs.push(`宵禁令 · 冻结 ${p.frozenRounds} 回合`);
+    if (p.youjingPending) buffs.push('幽径暗道 · 待穿越（本回合）');
+    if (p.hidden?.almsNetwork) buffs.push('丐帮情报网络 · 永久');
+    if (p.hidden?.undergroundNetwork) buffs.push('地下网络 · 永久');
+    if (p.hidden?.hunterIntuition) buffs.push('猎户直觉 · 永久');
+
+    const wrap = document.createElement('div');
+    wrap.style.marginTop = '8px';
+
+    const head = document.createElement('div');
+    head.innerHTML = `<span class="pill">${sideName(side)} Buff</span>`;
+    wrap.appendChild(head);
+
+    if (!buffs.length) {
+      const none = document.createElement('div');
+      none.className = 'muted';
+      none.style.marginTop = '6px';
+      none.textContent = '暂无持续效果';
+      wrap.appendChild(none);
+      return wrap;
+    }
+
+    const bar = document.createElement('div');
+    bar.style.display = 'flex';
+    bar.style.flexWrap = 'wrap';
+    bar.style.gap = '6px';
+    bar.style.marginTop = '6px';
+    for (const text of buffs) {
+      const p = document.createElement('span');
+      p.className = 'pill';
+      p.textContent = text;
+      bar.appendChild(p);
+    }
+    wrap.appendChild(bar);
+    return wrap;
+  };
+
+  stat.appendChild(mkBuffLine('A'));
+  stat.appendChild(mkBuffLine('B'));
   root.appendChild(stat);
 
   return root;
@@ -810,7 +1038,7 @@ function renderRoom() {
   const roster = snap.roster;
 
   // top controls
-  $('selfTag').textContent = `${me.role}${me.seat ? `(${me.seat})` : ''}`;
+  $('selfTag').textContent = roleName(me.role);
   $('btnStart').disabled = !(room.refToken === me.token);
   $('btnAdvance').disabled = !(room.refToken === me.token);
 
@@ -841,8 +1069,29 @@ function renderRoom() {
     viewRoot.innerHTML = '';
     viewRoot.appendChild(renderRefView(view));
   }
+
+  // DOM 更新后：应用语言（对新增节点也生效）
+  applyLanguage();
+}
+
+function initLanguageToggle() {
+  const sel = document.getElementById('langSelect');
+  if (!sel) return;
+
+  // 默认值
+  sel.value = state.lang || 'zh-CN';
+
+  sel.addEventListener('change', () => {
+    state.lang = sel.value || 'zh-CN';
+    localStorage.setItem('beiguo_lang', state.lang);
+    applyLanguage();
+  });
+
+  // 首次应用
+  applyLanguage();
 }
 
 // init
 setMode('join');
+initLanguageToggle();
 startWs();
