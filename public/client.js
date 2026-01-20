@@ -13,7 +13,18 @@ const state = {
 
   // i18n
   lang: localStorage.getItem('beiguo_lang') || 'zh-CN'
+  ,
+  showGodView: (localStorage.getItem('beiguo_show_god') ?? '1') === '1'
 };
+
+function setShowGodView(v) {
+  state.showGodView = !!v;
+  localStorage.setItem('beiguo_show_god', state.showGodView ? '1' : '0');
+}
+
+function roomHasJudge(room) {
+  return !!(room && room.seats && room.seats.REF && room.refToken && room.seats.REF === room.refToken);
+}
 
 // --- 简体/繁体切换（基于 OpenCC-JS）---
 const i18n = {
@@ -167,32 +178,101 @@ function getGameOverFromView(view) {
 }
 
 function updateGameOverUI(view) {
-  const box = document.getElementById('gameOverBox');
-  if (!box) return;
+  const modal = document.getElementById('gameOverModal');
+  const win = document.getElementById('gameOverModalWin');
+  const titleEl = document.getElementById('gameOverModalTitle');
+  const bodyEl = document.getElementById('gameOverModalBody');
+  if (!modal || !win || !titleEl || !bodyEl) return;
 
   const over = getOverFromView(view);
   const go = getGameOverFromView(view);
 
   if (!over || !go) {
-    box.style.display = 'none';
-    box.textContent = '';
+    modal.classList.remove('show');
+    modal.setAttribute('aria-hidden', 'true');
+    titleEl.textContent = '游戏结束';
+    bodyEl.textContent = '';
+    win.classList.remove('win', 'lose', 'draw');
+    state.gameOverShownKey = null;
+    state.gameOverDismissedKey = null;
     return;
   }
 
-  box.style.display = 'block';
+  // prevent re-opening if user dismissed this exact ending
+  const key = JSON.stringify({ w: go.winner || null, r: go.reason || null, l: go.location || null, s: go.story ? String(go.story).slice(0, 80) : null });
+  if (state.gameOverDismissedKey && state.gameOverDismissedKey === key) return;
+
   // 平局
   if (!go.winner || go.reason === 'draw') {
-    box.textContent = '🤝 游戏结束：双方抓捕成功，平局';
+    win.classList.remove('win', 'lose');
+    win.classList.add('draw');
+    titleEl.textContent = '🤝 游戏结束';
+    bodyEl.textContent = '双方抓捕成功，平局';
+    modal.classList.add('show');
+    modal.setAttribute('aria-hidden', 'false');
+    state.gameOverShownKey = key;
+    applyLanguage();
     return;
   }
 
+  // winner display name
+  let winnerName = sideName(go.winner);
+  try {
+    const snap = state.snapshot;
+    const seatToken = snap && snap.room && snap.room.seats ? snap.room.seats[go.winner] : null;
+    const r = snap && snap.roster ? snap.roster.find(x => x.token === seatToken) : null;
+    if (r && r.nick) winnerName = `${r.nick}（${sideName(go.winner)}）`;
+  } catch {}
+
+  const location = go.location ? ` · 地点：${go.location}` : '';
+
   // 个人胜负判断：玩家视角有 seat；裁判/观众直接展示 winner
+  let headline;
   if (state.self && state.self.seat && (state.self.role === 'A' || state.self.role === 'B')) {
     const iWin = go.winner === state.self.seat;
-    box.textContent = iWin ? '🎉 你成功抓捕敌方间谍，游戏结束' : '💀 你的间谍被捕，游戏结束';
-  } else {
-    box.textContent = `🏁 游戏结束：${go.winner} 方胜利（抓捕成功）`;
+    win.classList.remove('win', 'lose', 'draw');
+    win.classList.add(iWin ? 'win' : 'lose');
+    headline = iWin ? `🎉 你成功抓捕敌方间谍，游戏结束${location}` : `💀 你的间谍被捕，游戏结束${location}`;
+    // 替换剧情里的 XXX
+    if (go.story) {
+      const who = iWin ? '你' : winnerName;
+      const story = String(go.story).replaceAll('XXX', who);
+      titleEl.textContent = headline;
+      bodyEl.textContent = story;
+      modal.classList.add('show');
+      modal.setAttribute('aria-hidden', 'false');
+      state.gameOverShownKey = key;
+      applyLanguage();
+      return;
+    }
+    titleEl.textContent = headline;
+    bodyEl.textContent = '';
+    modal.classList.add('show');
+    modal.setAttribute('aria-hidden', 'false');
+    state.gameOverShownKey = key;
+    applyLanguage();
+    return;
   }
+
+  win.classList.remove('win', 'lose', 'draw');
+  win.classList.add('win');
+  headline = `🏁 游戏结束：${winnerName} 胜利（抓捕成功）${location}`;
+  if (go.story) {
+    const story = String(go.story).replaceAll('XXX', winnerName);
+    titleEl.textContent = headline;
+    bodyEl.textContent = story;
+    modal.classList.add('show');
+    modal.setAttribute('aria-hidden', 'false');
+    state.gameOverShownKey = key;
+    applyLanguage();
+    return;
+  }
+  titleEl.textContent = headline;
+  bodyEl.textContent = '';
+  modal.classList.add('show');
+  modal.setAttribute('aria-hidden', 'false');
+  state.gameOverShownKey = key;
+  applyLanguage();
 }
 
 function lockControlsIfOver(view) {
@@ -216,6 +296,57 @@ function wsUrl() {
 // --- WebSocket 连接（含自动重连）---
 let reconnectAttempt = 0;
 let reconnectTimer = null;
+
+// 等待 WebSocket 进入 OPEN：用于「创建/加入房间」时确保连接已就绪。
+// 场景：房主踢人后，用户不刷新页面直接再次加入/创建。
+// 如果 WS 已被关闭/正在重连，需要在发送 JOIN/CREATE 前等待连接完成。
+async function connectWs(timeoutMs = 5000) {
+  // 已连接
+  if (state.ws && state.ws.readyState === 1) return;
+
+  // 如果不存在连接或已关闭，则发起连接
+  if (!state.ws || state.ws.readyState === 3) {
+    startWs();
+  }
+
+  // 等待 OPEN / ERROR / CLOSE / 超时
+  await new Promise((resolve, reject) => {
+    const ws = state.ws;
+    if (!ws) return reject(new Error('ws not initialized'));
+
+    if (ws.readyState === 1) return resolve();
+
+    const t = setTimeout(() => {
+      cleanup();
+      reject(new Error('ws connect timeout'));
+    }, timeoutMs);
+
+    const onOpen = () => {
+      cleanup();
+      resolve();
+    };
+    const onClose = () => {
+      cleanup();
+      // 关闭后交给自动重连，但这里仍然拒绝，让调用方提示用户再试
+      reject(new Error('ws closed'));
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error('ws error'));
+    };
+
+    function cleanup() {
+      clearTimeout(t);
+      ws.removeEventListener('open', onOpen);
+      ws.removeEventListener('close', onClose);
+      ws.removeEventListener('error', onError);
+    }
+
+    ws.addEventListener('open', onOpen);
+    ws.addEventListener('close', onClose);
+    ws.addEventListener('error', onError);
+  });
+}
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
@@ -369,6 +500,31 @@ $('btnCopy').onclick = async () => {
 
 $('btnStart').onclick = () => send('START_GAME');
 $('btnAdvance').onclick = () => send('ADVANCE_PHASE');
+
+// --- Game over modal interactions ---
+function initGameOverModal() {
+  const modal = document.getElementById('gameOverModal');
+  const win = document.getElementById('gameOverModalWin');
+  const closeBtn = document.getElementById('gameOverModalClose');
+  if (!modal || !win || !closeBtn) return;
+
+  const close = () => {
+    modal.classList.remove('show');
+    modal.setAttribute('aria-hidden', 'true');
+    // mark dismissed so re-renders won't re-open this exact ending
+    if (state.gameOverShownKey) state.gameOverDismissedKey = state.gameOverShownKey;
+  };
+
+  closeBtn.onclick = close;
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) close();
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') close();
+  });
+}
+
+initGameOverModal();
 
 // --- Roster rendering (host controls) ---
 function isHost() {
@@ -1039,8 +1195,39 @@ function renderRoom() {
 
   // top controls
   $('selfTag').textContent = roleName(me.role);
-  $('btnStart').disabled = !(room.refToken === me.token);
-  $('btnAdvance').disabled = !(room.refToken === me.token);
+  const hasJudge = roomHasJudge(room);
+  // START：有裁判 -> 裁判；无裁判 -> 房主
+  $('btnStart').disabled = !(hasJudge ? (room.refToken === me.token) : isHost());
+  // ADVANCE：仅裁判制允许手动推进（自动裁判模式默认自动推进）
+  $('btnAdvance').disabled = !(hasJudge && room.refToken === me.token);
+
+  // header god-view toggle（本地开关：只影响本机显示）
+  const wrap = document.getElementById('godToggleWrap');
+  if (wrap) {
+    wrap.innerHTML = '';
+    if (snap.view && snap.view.kind === 'ref_view') {
+      const lbl = document.createElement('label');
+      lbl.style.display = 'flex';
+      lbl.style.alignItems = 'center';
+      lbl.style.gap = '6px';
+      lbl.style.margin = '0 0 0 6px';
+      lbl.style.fontSize = '12px';
+      lbl.style.color = '#555';
+      const ck = document.createElement('input');
+      ck.type = 'checkbox';
+      ck.checked = !!state.showGodView;
+      ck.onchange = () => {
+        setShowGodView(ck.checked);
+        renderRoom();
+      };
+      const span = document.createElement('span');
+      span.textContent = state.showGodView ? '显示上帝视角' : '隐藏上帝视角';
+      lbl.appendChild(ck);
+      lbl.appendChild(span);
+      wrap.appendChild(lbl);
+      applyLanguage();
+    }
+  }
 
   updateGameOverUI(snap.view);
   lockControlsIfOver(snap.view);
@@ -1067,7 +1254,18 @@ function renderRoom() {
     viewRoot.appendChild(renderPlayerView(view));
   } else {
     viewRoot.innerHTML = '';
-    viewRoot.appendChild(renderRefView(view));
+    if (state.showGodView) {
+      viewRoot.appendChild(renderRefView(view));
+    } else {
+      const card = document.createElement('div');
+      card.className = 'card';
+      const hasJudge = roomHasJudge(room);
+      card.innerHTML = `
+        <div style="font-weight:800">已隐藏上帝视角</div>
+        <div class="muted" style="margin-top:6px">你仍可作为房主管理在线列表${hasJudge ? '，并可在需要时勾选显示上帝视角' : '。当前未分配裁判：处于自动裁判模式'}。</div>
+      `;
+      viewRoot.appendChild(card);
+    }
   }
 
   // DOM 更新后：应用语言（对新增节点也生效）
