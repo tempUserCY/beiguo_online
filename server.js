@@ -4,10 +4,13 @@ import { WebSocketServer } from 'ws';
 import crypto from 'crypto';
 
 /**
- * 北国密令 - 联机服务器（裁判制）
+ * 北国密令 - 联机服务器
  * - 房间号系统生成
- * - Host 默认裁判，可移交 Host（移交即失去房主权限）
- * - 裁判/观众上帝视角；玩家仅见自己视图
+ * - 房主（Host）始终保留在线列表管理能力，可移交 Host（移交即失去房主权限）
+ * - 可选裁判：
+ *    - 当在线列表分配了“裁判”席位（REF）时：沿用裁判制流程（裁判开始/推进阶段）。
+ *    - 当未分配裁判席位时：进入“自动裁判”模式（房主可开始；阶段按规则自动推进）。
+ * - 裁判/观众可上帝视角；玩家仅见自己视图
  * - 不做聊天
  */
 
@@ -170,6 +173,16 @@ const CELL_NAMES = [
   ["药店", "塔楼", "浴室"],
   ["小桥", "水井", "米奇不妙屋"]
 ];
+
+// 结局剧情（先内置 4 种；未来可扩展到 9 种）
+const ENDING_STORIES = {
+  '池塘': 'XXX从身后慢慢接近毫无防备的神秘黑影，瞬时间ta扑了上去将那黑影摁到在池塘里，过了不知多久，那黑影没了动作，XXX在人群围上来前偷偷的离开了......',
+  '红树': 'XXX在红树上不知呆了多久，正当ta又快打瞌睡时ta等待的目标终于来了，XXX小心翼翼地用吹管瞄准了那马上的神秘黑影，只听到微小的砰的一声，马上的黑影下意识摸了摸后背，忽然浑身颤抖，僵硬的坠下了马，XXX顺势从树上跳到了马背上后扬长而去......',
+  '马车': '车夫将马车卸载在了路边，找饭摊吃饭去了，就这样马车似乎在路边无人问津。过了不知多久，一个神秘的人影小心的凑到了马车旁脸色紧张的对暗号，但马车似乎并没有回应。正当黑影准备探头往马车里看时，月影下血光飞溅，银刃从黑影的脖颈处穿梭而过。马车里的XXX冷漠的看了眼尸体，顺着摊位的人群消失了......',
+  // 盘面是“药店”，剧情用“药房”文案；做兼容映射
+  '药店': '药房里的来了位神秘客人，似乎不断地咳嗽着。他请求到大夫尽快配药，自己的身体似乎极度不适。那大夫没说话，只是眼神示意着不要着急，随后那大夫暗示着想请客人去二楼诊所把脉。那客人晃晃悠悠的准备跟上去时，在阶梯的尽头突然失去了意识，一路从楼梯上滚了下来，似乎是断了气，正当店里的人围着神秘客人看时，那大夫在二楼卸下了伪装，将蒙汗药扔向了煎药炉里，从二楼窗口离开了。',
+  '药房': '药房里的来了位神秘客人，似乎不断地咳嗽着。他请求到大夫尽快配药，自己的身体似乎极度不适。那大夫没说话，只是眼神示意着不要着急，随后那大夫暗示着想请客人去二楼诊所把脉。那客人晃晃悠悠的准备跟上去时，在阶梯的尽头突然失去了意识，一路从楼梯上滚了下来，似乎是断了气，正当店里的人围着神秘客人看时，那大夫在二楼卸下了伪装，将蒙汗药扔向了煎药炉里，从二楼窗口离开了。'
+};
 
 function posName(pos) {
   if (!pos) return "未部署";
@@ -427,8 +440,11 @@ function advancePhase(state) {
         addLog(state, { text: `R${state.round} · 抓捕结算：双方均抓捕成功，平局。`, vis: 'ALL' });
       } else {
         const winner = aHit ? 'A' : 'B';
+        const loser = winner === 'A' ? 'B' : 'A';
+        const loc = posName(state[loser].spyPos);
+        const story = ENDING_STORIES[loc] || null;
         state.over = true;
-        state.gameOver = { winner, reason: 'capture' };
+        state.gameOver = { winner, reason: 'capture', location: loc, story };
         addLog(state, { text: `R${state.round} · 抓捕结算：${winner} 方抓捕成功，游戏结束。`, vis: 'ALL' });
       }
     }
@@ -806,10 +822,27 @@ function cleanupRooms() {
 setInterval(cleanupRooms, 30 * 1000);
 
 function ensureHostAndRef(room, token) {
-  // 第一个进房间的人自动当 Host + Ref
+  // 第一个进房间的人自动当 Host。
+  // 裁判（REF）由在线列表是否分配决定；创建房间时会默认把房主也设为裁判。
   if (!room.hostToken) room.hostToken = token;
-  if (!room.refToken) room.refToken = token;
-  if (!room.seats.REF) room.seats.REF = token;
+}
+
+function hasJudge(room) {
+  return !!(room.seats && room.seats.REF && room.refToken && room.seats.REF === room.refToken);
+}
+
+function maybeAutoAdvance(room) {
+  // 仅在“未分配裁判席位”时启用自动推进
+  if (hasJudge(room)) return;
+  if (!room.state || !room.state.started || room.state.over) return;
+
+  // 可能连续推进：部署->追捕->新回合（例如双方冻结等极端情况）
+  for (let i = 0; i < 3; i++) {
+    const ok = canAdvancePhase(room.state);
+    if (!ok.ok) break;
+    const res = advancePhase(room.state);
+    if (!res.ok) break;
+  }
 }
 
 function assignRoleFromSeats(room, token) {
@@ -858,7 +891,10 @@ wss.on('connection', (ws) => {
 
       // 记录 client
       room.clients.set(clientToken, { ws, nick, role: 'SPECTATOR', seat: null });
+      // 默认：创建者为房主；并默认也担任裁判（可在在线列表里取消分配裁判席位）
       ensureHostAndRef(room, clientToken);
+      room.refToken = clientToken;
+      room.seats.REF = clientToken;
       const rr = assignRoleFromSeats(room, clientToken);
       room.clients.get(clientToken).role = rr.role;
       room.clients.get(clientToken).seat = rr.seat;
@@ -941,6 +977,8 @@ wss.on('connection', (ws) => {
       for (const k of ['A', 'B', 'REF']) {
         if (room.seats[k] === targetToken) room.seats[k] = null;
       }
+      // 如果被移除的是当前裁判，也一并清空裁判权限（可进入自动裁判模式）
+      if (room.refToken === targetToken) room.refToken = null;
 
       if (seat === 'A' || seat === 'B') {
         room.seats[seat] = targetToken;
@@ -950,6 +988,9 @@ wss.on('connection', (ws) => {
       } else {
         // spectator
       }
+
+      // 若当前没有裁判席位，则裁判权限也必须为空
+      if (!room.seats.REF) room.refToken = null;
 
       // 重新计算所有人 role
       for (const [t, cc] of room.clients.entries()) {
@@ -1054,9 +1095,17 @@ wss.on('connection', (ws) => {
 
     // --- 游戏控制 ---
     if (type === 'START_GAME') {
-      if (!mustBeRef(room, clientToken)) {
-        send(ws, { type: 'ERROR', message: '只有裁判可以开始/重置游戏。' });
-        return;
+      // 有裁判时：裁判开始；无裁判时：房主开始
+      if (hasJudge(room)) {
+        if (!mustBeRef(room, clientToken)) {
+          send(ws, { type: 'ERROR', message: '只有裁判可以开始/重置游戏。' });
+          return;
+        }
+      } else {
+        if (!mustBeHost(room, clientToken)) {
+          send(ws, { type: 'ERROR', message: '当前未分配裁判：只有房主可以开始/重置游戏。' });
+          return;
+        }
       }
       room.state = defaultTruthState();
       room.state.started = true;
@@ -1075,9 +1124,17 @@ wss.on('connection', (ws) => {
     }
 
     if (type === 'ADVANCE_PHASE') {
-      if (!mustBeRef(room, clientToken)) {
-        send(ws, { type: 'ERROR', message: '只有裁判可以推进阶段。' });
-        return;
+      // 有裁判时：裁判推进；无裁判时：默认自动推进（保留房主手动推进以便调试）
+      if (hasJudge(room)) {
+        if (!mustBeRef(room, clientToken)) {
+          send(ws, { type: 'ERROR', message: '只有裁判可以推进阶段。' });
+          return;
+        }
+      } else {
+        if (!mustBeHost(room, clientToken)) {
+          send(ws, { type: 'ERROR', message: '当前未分配裁判：只有房主可以手动推进阶段。' });
+          return;
+        }
       }
       if (!room.state.started) {
         send(ws, { type: 'ERROR', message: '请先开始游戏。' });
@@ -1098,7 +1155,7 @@ wss.on('connection', (ws) => {
       const to = msg?.to;
 
       if (!room.state.started) {
-        send(ws, { type: 'ERROR', message: '请等待裁判开始游戏。' });
+        send(ws, { type: 'ERROR', message: hasJudge(room) ? '请等待裁判开始游戏。' : '请等待房主开始游戏。' });
         return;
       }
 
@@ -1113,6 +1170,11 @@ wss.on('connection', (ws) => {
         return;
       }
       broadcastRoom(room);
+      // 自动裁判：若满足推进条件则自动推进（并再次广播）
+      const before = room.state.round + '|' + room.state.phase;
+      maybeAutoAdvance(room);
+      const after = room.state.round + '|' + room.state.phase;
+      if (before !== after || room.state.over) broadcastRoom(room);
       return;
     }
 
@@ -1121,7 +1183,7 @@ wss.on('connection', (ws) => {
       const payload = msg?.payload;
 
       if (!room.state.started) {
-        send(ws, { type: 'ERROR', message: '请等待裁判开始游戏。' });
+        send(ws, { type: 'ERROR', message: hasJudge(room) ? '请等待裁判开始游戏。' : '请等待房主开始游戏。' });
         return;
       }
 
@@ -1136,6 +1198,10 @@ wss.on('connection', (ws) => {
         return;
       }
       broadcastRoom(room);
+      const before = room.state.round + '|' + room.state.phase;
+      maybeAutoAdvance(room);
+      const after = room.state.round + '|' + room.state.phase;
+      if (before !== after || room.state.over) broadcastRoom(room);
       return;
     }
 
