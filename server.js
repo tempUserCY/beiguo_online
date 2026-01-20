@@ -66,6 +66,8 @@ function defaultTruthState() {
     // 每阶段每方必须至少移动一次（没被宵禁）
     movesThisPhase: { A: 0, B: 0 },
     cardsUsedThisPhase: { A: false, B: false },
+    // 每回合（部署+追捕）每方最多使用 1 次锦囊
+    cardsUsedThisRound: { A: false, B: false },
 
     A: {
       spyPos: null,
@@ -74,7 +76,7 @@ function defaultTruthState() {
       frozenRounds: 0,
       // 差役成群
       patrolActive: false,
-      patrolStepsLeft: 0,
+      patrolRoundsLeft: 0,
       patrolVisitedOuter: [],
       // 幽径暗道
       youjingPending: false,
@@ -106,7 +108,7 @@ function defaultTruthState() {
       hunterPos: null,
       frozenRounds: 0,
       patrolActive: false,
-      patrolStepsLeft: 0,
+      patrolRoundsLeft: 0,
       patrolVisitedOuter: [],
       youjingPending: false,
       youjingDiag1: false,
@@ -297,9 +299,12 @@ function applyMove(state, side, piece, to) {
       }
     }
 
-    // 差役成群：巡逻状态
-    if (p.patrolActive && p.patrolStepsLeft > 0) {
-      p.patrolStepsLeft -= 1;
+    // 差役成群：巡逻状态（持续若干“回合”，回合数在回合结算时递减）
+    // 这里在每次“部署阶段移动间谍”后：
+    // - 记录外围走格
+    // - 判断隐藏触发
+    // - 记录“巡逻撞见敌方间谍”的日志
+    if (p.patrolActive && p.patrolRoundsLeft > 0) {
 
       // 不间断外围走遍判定（全自动）
       if (isOuterCell(p.spyPos)) {
@@ -316,7 +321,7 @@ function applyMove(state, side, piece, to) {
           addLog(state, { text: `R${state.round} · 隐藏：${side}方触发【宵禁令】，清空敌方锦囊并冻结 1 回合。`, vis: 'REF' });
           // 触发后结束巡逻
           p.patrolActive = false;
-          p.patrolStepsLeft = 0;
+          p.patrolRoundsLeft = 0;
         }
       }
 
@@ -326,17 +331,12 @@ function applyMove(state, side, piece, to) {
         addLog(state, { text: `R${state.round} · 差役成群：${side}方巡逻中撞见敌方间谍。`, vis: 'REF' });
       }
 
-      if (p.patrolStepsLeft === 0 && p.patrolActive) {
-        p.patrolActive = false;
-        p.patrolVisitedOuter = [];
-        addLog(state, { text: `R${state.round} · 差役成群：你的巡逻结束。`, vis: side });
-        addLog(state, { text: `R${state.round} · 差役成群：${side}方巡逻结束。`, vis: 'REF' });
-      }
+      // 巡逻自然结束：由回合结算（ADVANCE_PHASE 进入下一回合）统一处理
     }
 
     // 差役成群 BUG 修复：若对手正处于巡逻状态，而我方间谍后来进入/部署到相同格子，
     // 需要让对手也能“撞见”敌方（否则会因先结算导致漏判）。
-    if (!p.patrolActive && opp.patrolActive && opp.patrolStepsLeft > 0 && posEq(p.spyPos, opp.spyPos)) {
+    if (!p.patrolActive && opp.patrolActive && opp.patrolRoundsLeft > 0 && posEq(p.spyPos, opp.spyPos)) {
       addLog(state, { text: `R${state.round} · 差役成群：巡逻中撞见敌方间谍所在格！`, vis: oppSide });
       addLog(state, { text: `R${state.round} · 差役成群：${oppSide}方巡逻中撞见敌方间谍（由敌方后进入触发）。`, vis: 'REF' });
     }
@@ -448,7 +448,24 @@ function advancePhase(state) {
     if (state.A.frozenRounds > 0) state.A.frozenRounds -= 1;
     if (state.B.frozenRounds > 0) state.B.frozenRounds -= 1;
 
+    // 差役成群：巡逻回合数递减（回合结束时统一结算）
+    for (const s of ['A', 'B']) {
+      const p = state[s];
+      if (p.patrolActive && p.patrolRoundsLeft > 0) {
+        p.patrolRoundsLeft -= 1;
+        if (p.patrolRoundsLeft <= 0) {
+          p.patrolActive = false;
+          p.patrolVisitedOuter = [];
+          addLog(state, { text: `R${state.round} · 差役成群：${s}方巡逻结束（持续回合到期）。`, vis: 'REF' });
+          addLog(state, { text: `R${state.round} · 差役成群：你的巡逻结束。`, vis: s });
+        }
+      }
+    }
+
     state.round += 1;
+    // 进入新回合时，清空“本回合已用锦囊”标记（部署+追捕共用）
+    state.cardsUsedThisRound.A = false;
+    state.cardsUsedThisRound.B = false;
     state.phase = 'deploy';
     addLog(state, { text: `回合：进入第 ${state.round} 回合（部署阶段）。`, vis: 'ALL' });
   }
@@ -462,6 +479,11 @@ function applyPlayCard(state, side, cardName, payload) {
   if (side !== 'A' && side !== 'B') return { ok: false, err: '非法阵营。' };
   const p = state[side];
   if (p.frozenRounds > 0) return { ok: false, err: '你已被【宵禁令】冻结，本回合无法行动。' };
+
+  // 一回合=部署+追捕：同一回合内只能使用一次锦囊
+  if (state.cardsUsedThisRound[side]) {
+    return { ok: false, err: '本回合你已经使用过锦囊（部署+追捕合计一次）。' };
+  }
 
   if (state.cardsUsedThisPhase[side]) {
     return { ok: false, err: '本阶段你已经使用过锦囊。' };
@@ -493,16 +515,22 @@ function applyPlayCard(state, side, cardName, payload) {
 
   // --- 差役成群 ---
   if (cardName === '差役成群') {
+    // 若巡逻效果未结束，禁止再次使用（避免叠加/刷新）
+    if (p.patrolActive && p.patrolRoundsLeft > 0) {
+      return { ok: false, err: '【差役成群】效果尚未结束，不能再次使用。' };
+    }
+
     p.cards[cardName] -= 1;
     state.cardsUsedThisPhase[side] = true;
+    state.cardsUsedThisRound[side] = true;
 
     // 若之前巡逻已断（patrolActive=false），则从头记录外围走格（不间断要求）
     if (!p.patrolActive) p.patrolVisitedOuter = [];
     p.patrolActive = true;
-    p.patrolStepsLeft = 3;
+    p.patrolRoundsLeft = 3;
 
-    addLog(state, { text: `R${state.round} · 锦囊：你使用【差役成群】，接下来 3 步为巡逻状态。`, vis: side });
-    addLog(state, { text: `R${state.round} · 锦囊：${side}方使用【差役成群】（巡逻 3 步）。`, vis: 'REF' });
+    addLog(state, { text: `R${state.round} · 锦囊：你使用【差役成群】，效果持续 3 回合（期间每回合部署移动将记录外围巡逻）。`, vis: side });
+    addLog(state, { text: `R${state.round} · 锦囊：${side}方使用【差役成群】（持续 3 回合）。`, vis: 'REF' });
     return { ok: true };
   }
 
@@ -513,6 +541,7 @@ function applyPlayCard(state, side, cardName, payload) {
 
     p.cards[cardName] -= 1;
     state.cardsUsedThisPhase[side] = true;
+    state.cardsUsedThisRound[side] = true;
     p.youjingPending = true;
 
     addLog(state, { text: `R${state.round} · 锦囊：你在角上发动【幽径暗道】，本回合下一次间谍移动可从当前角穿越到对角角。`, vis: side });
@@ -553,6 +582,7 @@ function applyPlayCard(state, side, cardName, payload) {
 
     p.cards[cardName] -= 1;
     state.cardsUsedThisPhase[side] = true;
+    state.cardsUsedThisRound[side] = true;
 
     const v = dirMap[dir];
     const origin = p.spyPos;
@@ -605,6 +635,7 @@ function applyPlayCard(state, side, cardName, payload) {
 
     p.cards[cardName] -= 1;
     state.cardsUsedThisPhase[side] = true;
+    state.cardsUsedThisRound[side] = true;
 
     const o = p.spyPos;
     const t = opp.spyPos;
@@ -671,6 +702,7 @@ function maskForRole(state, role, seat) {
     gameOver: state.gameOver,
     movesThisPhase: { [side]: state.movesThisPhase[side] },
     cardsUsedThisPhase: { [side]: state.cardsUsedThisPhase[side] },
+    cardsUsedThisRound: { [side]: state.cardsUsedThisRound[side] },
     self: {
       spyPos: state[side].spyPos,
       hunterPos: state[side].hunterPos,
@@ -679,7 +711,7 @@ function maskForRole(state, role, seat) {
       // 自己的隐藏效果/状态自己当然知道
       hidden: state[side].hidden,
       patrolActive: state[side].patrolActive,
-      patrolStepsLeft: state[side].patrolStepsLeft,
+      patrolRoundsLeft: state[side].patrolRoundsLeft,
       patrolVisitedOuter: state[side].patrolVisitedOuter,
       youjingPending: state[side].youjingPending
     },
