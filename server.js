@@ -4,7 +4,7 @@ import { WebSocketServer } from 'ws';
 import crypto from 'crypto';
 
 /**
- * 北国密令 - 联机MVP服务器（裁判制）
+ * 北国密令 - 联机服务器（裁判制）
  * - 房间号系统生成
  * - Host 默认裁判，可移交 Host（移交即失去房主权限）
  * - 裁判/观众上帝视角；玩家仅见自己视图
@@ -968,6 +968,58 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    if (type === 'KICK_MEMBER') {
+      if (!mustBeHost(room, clientToken)) {
+        send(ws, { type: 'ERROR', message: '只有房主可以踢人。' });
+        return;
+      }
+      const targetToken = String(msg?.targetToken ?? '').trim();
+      if (!targetToken || !room.clients.has(targetToken)) {
+        send(ws, { type: 'ERROR', message: '目标玩家不在房间里。' });
+        return;
+      }
+      if (targetToken === room.hostToken) {
+        send(ws, { type: 'ERROR', message: '不能踢出房主。' });
+        return;
+      }
+
+      const target = room.clients.get(targetToken);
+      const targetNick = target?.nick || '玩家';
+
+      // 清空席位（如果占座）
+      for (const k of ['A', 'B', 'REF']) {
+        if (room.seats[k] === targetToken) room.seats[k] = null;
+      }
+
+      // 如果踢掉的是裁判，则把裁判权限回收给房主（房主默认裁判）
+      if (room.refToken === targetToken) {
+        room.refToken = room.hostToken;
+        room.seats.REF = room.hostToken;
+      }
+
+      // 先通知并断开目标连接
+      try {
+        send(target.ws, { type: 'KICKED', message: '你已被房主移出房间。' });
+      } catch {}
+      try {
+        target.ws.close();
+      } catch {}
+
+      // 从 roster 移除（允许其稍后重新加入：不做 ban）
+      room.clients.delete(targetToken);
+
+      // 重新计算所有人 role
+      for (const [t, cc] of room.clients.entries()) {
+        const rr = assignRoleFromSeats(room, t);
+        cc.role = rr.role;
+        cc.seat = rr.seat;
+      }
+
+      addLog(room.state, { text: `房主将 ${targetNick} 移出了房间。`, vis: 'ALL' });
+      broadcastRoom(room);
+      return;
+    }
+
     // --- 游戏控制 ---
     if (type === 'START_GAME') {
       if (!mustBeRef(room, clientToken)) {
@@ -1059,8 +1111,26 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    // 断线时不立即踢掉 token（保留 10 分钟重连由 cleanupRooms 处理）
-    // 这里不做任何事。
+    // 断线：从 roster 移除该连接对应的 client。
+    for (const room of rooms.values()) {
+      let removedAny = false;
+      for (const [token, c] of room.clients.entries()) {
+        if (c.ws !== ws) continue;
+
+        room.clients.delete(token);
+        removedAny = true;
+        addLog(room.state, { text: `${c.nick} 离开了房间。`, vis: 'ALL' });
+      }
+      if (removedAny) {
+        // 重新计算 role（seat 仍在，但人暂时不在 roster）
+        for (const [t, cc] of room.clients.entries()) {
+          const rr = assignRoleFromSeats(room, t);
+          cc.role = rr.role;
+          cc.seat = rr.seat;
+        }
+        broadcastRoom(room);
+      }
+    }
   });
 });
 
