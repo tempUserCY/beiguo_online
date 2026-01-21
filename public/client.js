@@ -12,9 +12,25 @@ const state = {
   pendingMove: null,
 
   // i18n
-  lang: localStorage.getItem('beiguo_lang') || 'zh-CN'
+  // Default: if user never picked a language, auto-detect from browser language.
+  lang: (function(){
+    const saved = localStorage.getItem('beiguo_lang');
+    if (saved) return saved;
+    const nav = (navigator.language || navigator.userLanguage || '').toLowerCase();
+    // Prefer English for non-Chinese users (improves discoverability on first load).
+    if (!nav.startsWith('zh')) return 'en';
+    // Traditional hints
+    if (nav.includes('tw') || nav.includes('hk') || nav.includes('mo') || nav.includes('hant')) return 'zh-TW';
+    return 'zh-CN';
+  })()
   ,
   showGodView: (localStorage.getItem('beiguo_show_god') ?? '1') === '1'
+  ,
+  // card result popups
+  popupQueue: [],
+  popupShowing: false,
+  popupSeenKeys: new Set(),
+  popupSeenKeysOrder: []
 };
 
 function setShowGodView(v) {
@@ -34,6 +50,63 @@ const i18n = {
   trackedAttrs: new Set() // elements with placeholder/title/data-i18n-* originals
 };
 
+// --- English i18n (UI strings) ---
+const EN_TEXT_MAP = {
+  // Header / general
+  '北国密令 · 联机版': 'Beiguo Secret Order · Online',
+  '语言': 'Language',
+  '简体': 'Simplified',
+  '繁體': 'Traditional',
+
+  // Join card
+  '临时昵称': 'Nickname',
+  '昵称会用于房主分配席位（大宋/契丹/裁判/观众）。': 'Nickname is used by the host to assign a seat (Song/Liao/Referee/Spectator).',
+  '房间号（加入用）': 'Room code (for joining)',
+  '创建房间会自动生成房间号。': 'Creating a room will generate a code automatically.',
+  '创建房间': 'Create room',
+  '加入房间': 'Join room',
+
+  // Room bar / actions
+  '未连接': 'Disconnected',
+  '房间号：': 'Room:',
+  '复制邀请链接': 'Copy invite link',
+  '若刷新页面，系统会用本地 token 尝试重连占座。': 'If you refresh, the system will try to reconnect using your local token.',
+  '开始/重置游戏（裁判）': 'Start/Reset game (Referee)',
+  '下一阶段（裁判）': 'Next phase (Referee)',
+
+  // Roster
+  '在线列表（房主可分配席位 / 转移房主）': 'Online roster (host can assign seats / transfer host)',
+  '昵称': 'Name',
+  '当前身份': 'Role',
+  '操作': 'Actions',
+  '说明：转移房主 = 指定对方为裁判并接管管理权限（你将失去房主权限）。': "Note: Transfer host = make them the Referee and hand over admin rights (you'll lose host privileges).",
+
+  // Log / modals
+  '日志': 'Log',
+  '游戏结束': 'Game Over',
+  '关闭': 'Close',
+  '结算提示': 'Result hint',
+  '结果': 'Result'
+};
+
+const EN_ATTR_MAP = {
+  // placeholders
+  '例如：玉玉': 'e.g., Yuyu',
+  '例如：ABCD12': 'e.g., ABCD12'
+};
+
+function _translatePreserveSpace(raw, map) {
+  const s = String(raw);
+  // Preserve leading/trailing whitespace exactly.
+  const m = s.match(/^(\s*)([\s\S]*?)(\s*)$/);
+  const lead = m ? m[1] : '';
+  const core = m ? m[2] : s;
+  const tail = m ? m[3] : '';
+  const mapped = Object.prototype.hasOwnProperty.call(map, core) ? map[core] : core;
+  return lead + mapped + tail;
+}
+
+
 function ensureOpenCC() {
   if (!window.OpenCC) return null;
   if (!i18n.converter) {
@@ -47,12 +120,14 @@ function applyLanguage() {
   const lang = state.lang || 'zh-CN';
   document.documentElement.lang = lang;
 
+  const isEn = (lang === 'en' || lang.startsWith('en-'));
   const toTrad = (lang === 'zh-TW' || lang === 'zh-Hant');
   const converter = toTrad ? ensureOpenCC() : null;
 
   // 1) Text nodes
   //    - 转繁：保存原文 -> 转换
-  //    - 转简：恢复原文
+  //    - 英文：保存原文 -> 映射
+  //    - 其它：恢复原文
   const walker = document.createTreeWalker(
     document.body,
     NodeFilter.SHOW_TEXT,
@@ -66,36 +141,36 @@ function applyLanguage() {
         if (!v || !v.trim()) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       }
-    },
-    false
+    }
   );
 
-  let n;
-  while ((n = walker.nextNode())) {
-    // 只处理包含中文的节点（避免无意义处理）
-    const cur = n.nodeValue;
-    if (!/[\u4e00-\u9fff]/.test(cur)) continue;
-
+  let node;
+  while ((node = walker.nextNode())) {
     if (toTrad) {
-      if (!converter) continue;
-      if (!i18n.textNodeOriginal.has(n)) {
-        i18n.textNodeOriginal.set(n, cur);
-        i18n.trackedTextNodes.add(n);
+      if (!i18n.textNodeOriginal.has(node)) {
+        i18n.textNodeOriginal.set(node, node.nodeValue);
+        i18n.trackedTextNodes.add(node);
       }
-      const orig = i18n.textNodeOriginal.get(n) || cur;
-      try {
-        n.nodeValue = converter(orig);
-      } catch {
-        // 如果 OpenCC 不可用/报错，就不转换
+      const orig = i18n.textNodeOriginal.get(node);
+      // 只处理包含中文的节点（避免无意义处理）
+      if (converter && /[\u4e00-\u9fff]/.test(orig || '')) {
+        try { node.nodeValue = converter(orig); } catch {}
       }
+    } else if (isEn) {
+      if (!i18n.textNodeOriginal.has(node)) {
+        i18n.textNodeOriginal.set(node, node.nodeValue);
+        i18n.trackedTextNodes.add(node);
+      }
+      const orig = i18n.textNodeOriginal.get(node);
+      node.nodeValue = _translatePreserveSpace(orig, EN_TEXT_MAP);
     } else {
-      if (i18n.textNodeOriginal.has(n)) {
-        n.nodeValue = i18n.textNodeOriginal.get(n);
+      if (i18n.textNodeOriginal.has(node)) {
+        try { node.nodeValue = i18n.textNodeOriginal.get(node); } catch {}
       }
     }
   }
 
-  // 2) Common attrs: placeholder / title
+  // 2) Attributes: placeholder / title
   const els = document.querySelectorAll('[placeholder],[title]');
   els.forEach(el => {
     if (!el || !el.getAttribute) return;
@@ -109,6 +184,10 @@ function applyLanguage() {
         if (converter && /[\u4e00-\u9fff]/.test(el.dataset.origPlaceholder || '')) {
           try { el.setAttribute('placeholder', converter(el.dataset.origPlaceholder)); } catch {}
         }
+      } else if (isEn) {
+        if (!el.dataset.origPlaceholder) el.dataset.origPlaceholder = cur;
+        i18n.trackedAttrs.add(el);
+        el.setAttribute('placeholder', EN_ATTR_MAP[el.dataset.origPlaceholder] || el.dataset.origPlaceholder);
       } else if (el.dataset.origPlaceholder) {
         el.setAttribute('placeholder', el.dataset.origPlaceholder);
       }
@@ -123,6 +202,10 @@ function applyLanguage() {
         if (converter && /[\u4e00-\u9fff]/.test(el.dataset.origTitle || '')) {
           try { el.setAttribute('title', converter(el.dataset.origTitle)); } catch {}
         }
+      } else if (isEn) {
+        if (!el.dataset.origTitle) el.dataset.origTitle = cur;
+        i18n.trackedAttrs.add(el);
+        el.setAttribute('title', EN_ATTR_MAP[el.dataset.origTitle] || EN_TEXT_MAP[el.dataset.origTitle] || el.dataset.origTitle);
       } else if (el.dataset.origTitle) {
         el.setAttribute('title', el.dataset.origTitle);
       }
@@ -130,23 +213,43 @@ function applyLanguage() {
   });
 
   // 3) Page title
+  if (!document.documentElement.dataset.origDocTitle) {
+    document.documentElement.dataset.origDocTitle = document.title;
+  }
   if (toTrad && converter) {
-    if (!document.documentElement.dataset.origDocTitle) {
-      document.documentElement.dataset.origDocTitle = document.title;
-    }
     try { document.title = converter(document.documentElement.dataset.origDocTitle); } catch {}
-  } else if (document.documentElement.dataset.origDocTitle) {
+  } else if (isEn) {
+    const base = document.documentElement.dataset.origDocTitle;
+    document.title = EN_TEXT_MAP[base] || 'Beiguo Secret Order · Online';
+  } else {
     document.title = document.documentElement.dataset.origDocTitle;
   }
 }
 
 function sideName(side) {
+  const lang = state.lang || 'zh-CN';
+  const isEn = (lang === 'en' || lang.startsWith('en-'));
+  if (isEn) {
+    if (side === 'A') return 'Song';
+    if (side === 'B') return 'Liao';
+    return String(side);
+  }
   if (side === 'A') return '大宋';
   if (side === 'B') return '契丹';
   return String(side);
 }
 
+
 function roleName(role) {
+  const lang = state.lang || 'zh-CN';
+  const isEn = (lang === 'en' || lang.startsWith('en-'));
+  if (isEn) {
+    if (role === 'A') return 'Song';
+    if (role === 'B') return 'Liao';
+    if (role === 'REF') return 'Referee';
+    if (role === 'SPECTATOR') return 'Spectator';
+    return String(role);
+  }
   if (role === 'A') return '大宋';
   if (role === 'B') return '契丹';
   if (role === 'REF') return '裁判';
@@ -154,16 +257,40 @@ function roleName(role) {
   return String(role);
 }
 
+
 function toast(msg) {
   const el = $('toast');
-  el.textContent = String(msg);
+  const lang = state.lang || 'zh-CN';
+  const isEn = (lang === 'en' || lang.startsWith('en-'));
+  const raw = String(msg);
+
+  let shown = raw;
+  if (isEn) {
+    // exact-match mapping first, fallback to unchanged
+    shown = EN_TEXT_MAP[raw] || raw;
+    // also map common toasts
+    const toastMap = {
+      '发生错误': 'Something went wrong.',
+      '你已被移出房间': 'You were removed from the room.',
+      '连接已断开，正在尝试重连…': 'Connection lost. Reconnecting…',
+      '未连接到服务器。': 'Not connected to the server.',
+      '请先输入昵称': 'Please enter a nickname first.',
+      '请输入房间号': 'Please enter a room code.',
+      '房间号已复制': 'Room code copied.',
+      '复制失败（浏览器不支持）': 'Copy failed (not supported by this browser).'
+    };
+    shown = toastMap[raw] || shown;
+  }
+
+  el.textContent = shown;
   el.style.display = 'block';
   clearTimeout(toast._t);
   toast._t = setTimeout(() => { el.style.display = 'none'; }, 2600);
 
-  // toast 是独立浮层，确保语言切换后也正确显示
+  // toast 是独立浮层，确保语言切换后也正确显示（切换繁体/英文时）
   applyLanguage();
 }
+
 
 function getOverFromView(view) {
   if (!view) return false;
@@ -526,6 +653,162 @@ function initGameOverModal() {
 
 initGameOverModal();
 
+// --- Card result popup (modal) ---
+function initEventModal() {
+  const modal = document.getElementById('eventModal');
+  const win = document.getElementById('eventModalWin');
+  const closeBtn = document.getElementById('eventModalClose');
+  if (!modal || !win || !closeBtn) return;
+
+  const close = () => {
+    modal.classList.remove('show');
+    modal.setAttribute('aria-hidden', 'true');
+    state.popupShowing = false;
+    // show next if queued
+    setTimeout(() => {
+      if (state.popupQueue.length) showNextPopup();
+    }, 30);
+  };
+
+  closeBtn.onclick = close;
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) close();
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal.classList.contains('show')) close();
+  });
+}
+
+function enqueuePopup(item) {
+  state.popupQueue.push(item);
+  if (!state.popupShowing) showNextPopup();
+}
+
+function showNextPopup() {
+  if (state.popupShowing) return;
+  const item = state.popupQueue.shift();
+  if (!item) return;
+
+  const modal = document.getElementById('eventModal');
+  const win = document.getElementById('eventModalWin');
+  const title = document.getElementById('eventModalTitle');
+  const body = document.getElementById('eventModalBody');
+  const badge = document.getElementById('eventModalBadge');
+  const icon = document.getElementById('eventModalIcon');
+  if (!modal || !win || !title || !body || !badge || !icon) return;
+
+  // style
+  win.classList.remove('card', 'hidden', 'neutral');
+  win.classList.add(item.tone || 'neutral');
+  title.textContent = item.title || '结算提示';
+  body.textContent = item.body || '';
+  badge.textContent = item.badge || '结果';
+  icon.textContent = item.icon || '📣';
+
+  modal.classList.add('show');
+  modal.setAttribute('aria-hidden', 'false');
+  state.popupShowing = true;
+
+  // i18n for newly set text
+  applyLanguage();
+
+  // auto dismiss (can be clicked earlier)
+  const ttl = Math.max(1200, Number(item.ttlMs || 4000));
+  const key = item._autoKey;
+  setTimeout(() => {
+    // if still showing and same popup
+    if (!state.popupShowing) return;
+    if (key && state._currentPopupKey !== key) return;
+    modal.classList.remove('show');
+    modal.setAttribute('aria-hidden', 'true');
+    state.popupShowing = false;
+    setTimeout(() => {
+      if (state.popupQueue.length) showNextPopup();
+    }, 30);
+  }, ttl);
+
+  state._currentPopupKey = key || null;
+}
+
+function isResultLogEntry(e) {
+  if (!e) return false;
+  return e.kind === 'CARD_RESULT' || e.kind === 'HIDDEN_RESULT';
+}
+
+function processResultPopups(logEntries) {
+  // 裁判/观众（第三方上帝视角）不需要任何判定弹窗：只记日志。
+  const selfRole = state?.snapshot?.self?.role;
+  if (selfRole === 'REF' || selfRole === 'SPECTATOR') return;
+  if (!Array.isArray(logEntries) || logEntries.length === 0) return;
+
+  for (const e of logEntries) {
+    if (!isResultLogEntry(e)) continue;
+    const key = `${e.t || ''}||${e.kind || ''}||${e.text || ''}`;
+    if (state.popupSeenKeys.has(key)) continue;
+
+    state.popupSeenKeys.add(key);
+    state.popupSeenKeysOrder.push(key);
+    // limit memory
+    if (state.popupSeenKeysOrder.length > 300) {
+      const old = state.popupSeenKeysOrder.shift();
+      if (old) state.popupSeenKeys.delete(old);
+    }
+
+    const isHidden = e.kind === 'HIDDEN_RESULT' || String(e.text || '').includes('· 隐藏');
+    enqueuePopup({
+      title: isHidden ? '隐藏效果结算' : '锦囊结算',
+      body: e.text,
+      badge: isHidden ? '隐藏' : '锦囊',
+      icon: isHidden ? '🕵️' : '🃏',
+      tone: isHidden ? 'hidden' : 'card',
+      ttlMs: 4200,
+      _autoKey: key
+    });
+  }
+}
+
+function formatThirdPartyLogText(e) {
+  // 上帝视角是给第三方（裁判/观众）的：日志里不要出现“你”，并且 A/B 要显示为 大宋/契丹。
+  // 同时加上玩家昵称（如果可获取）：大宋(昵称) / 契丹(昵称)
+  const snap = state.snapshot;
+  const roster = snap?.roster || [];
+  const seats = snap?.room?.seats || {};
+
+  function seatNick(side) {
+    const tok = seats?.[side];
+    if (!tok) return '';
+    const r = roster.find(x => x && x.token === tok);
+    return (r && r.nick) ? String(r.nick) : '';
+  }
+
+  function sideDisplay(side) {
+    const n = seatNick(side);
+    return n ? `${sideName(side)}(${n})` : sideName(side);
+  }
+
+  let t = String(e?.text || '');
+
+  // 先统一把 A/B 相关标记替换成「大宋(昵称)/契丹(昵称)」
+  // 1) 明确写法：A方/B方
+  t = t.replace(/A方/g, sideDisplay('A')).replace(/B方/g, sideDisplay('B'));
+  // 2) 兜底：单独 A/B（避免误伤：用边界 + 非字母数字边界双保险）
+  t = t.replace(/\bA\b/g, sideDisplay('A')).replace(/\bB\b/g, sideDisplay('B'));
+  t = t.replace(/(^|[^A-Za-z0-9_])A([^A-Za-z0-9_]|$)/g, `$1${sideDisplay('A')}$2`);
+  t = t.replace(/(^|[^A-Za-z0-9_])B([^A-Za-z0-9_]|$)/g, `$1${sideDisplay('B')}$2`);
+
+  // 再处理“你”：第三方日志里不应该出现“你”。
+  // - 如果日志带 vis=A/B，说明这条原本是写给某一方看的，用对应阵营替换。
+  // - 否则统一替换成「玩家」，避免出现第二人称。
+  const vis = String(e?.vis || '').toUpperCase();
+  if (vis === 'A') t = t.replace(/你/g, sideDisplay('A'));
+  else if (vis === 'B') t = t.replace(/你/g, sideDisplay('B'));
+  else t = t.replace(/你/g, '玩家');
+
+  return t;
+}
+
+initEventModal();
+
 // --- Roster rendering (host controls) ---
 function isHost() {
   const snap = state.snapshot;
@@ -732,6 +1015,8 @@ function renderBoard(root, boardId, view, sideForThisBoard, clickMode) {
 function renderLog(container, entries) {
   const div = document.createElement('div');
   div.className = 'log';
+  const selfRole = state?.snapshot?.self?.role;
+  const isThirdParty = (selfRole === 'REF' || selfRole === 'SPECTATOR');
   for (const e of entries) {
     const line = document.createElement('div');
     line.className = 'logLine';
@@ -753,7 +1038,7 @@ function renderLog(container, entries) {
       tag === 'win' ? '胜负' : '日志';
 
     const text = document.createElement('div');
-    text.textContent = e.text;
+    text.textContent = isThirdParty ? formatThirdPartyLogText(e) : e.text;
     line.appendChild(badge);
     line.appendChild(text);
     div.appendChild(line);
@@ -768,13 +1053,21 @@ function renderPlayerView(view) {
   const root = document.createElement('div');
 
   const banner = document.createElement('div');
-  const phaseName = view.phase === 'deploy' ? '部署阶段' : '追捕阶段';
-  banner.className = `phaseBanner ${view.phase === 'deploy' ? 'deploy' : 'chase'}`;
+  const phaseLabel = (p) => {
+    if (p === 'deploy_card') return '部署阶段出牌';
+    if (p === 'deploy_move') return '部署阶段';
+    if (p === 'hunt_card') return '抓捕阶段出牌';
+    if (p === 'hunt_move') return '抓捕阶段';
+    return String(p || '');
+  };
+  const isDeploy = String(view.phase || '').startsWith('deploy');
+  const isCardPhase = (view.phase === 'deploy_card' || view.phase === 'hunt_card');
+  banner.className = `phaseBanner ${isDeploy ? 'deploy' : 'chase'}`;
   banner.innerHTML = `
-    <div class="big">回合 ${view.round} · ${phaseName}</div>
+    <div class="big">回合 ${view.round} · ${phaseLabel(view.phase)}</div>
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
       <span class="pill ${view.side === 'A' ? 'a' : 'b'}">${sideName(view.side)}</span>
-      <span class="pill ${view.phase === 'deploy' ? 'phaseDeploy' : 'phaseChase'}">${view.phase === 'deploy' ? '间谍行动' : '追捕行动'}</span>
+      <span class="pill ${isDeploy ? 'phaseDeploy' : 'phaseChase'}">${isCardPhase ? '出牌' : (isDeploy ? '间谍行动' : '追捕行动')}</span>
     </div>
   `;
   root.appendChild(banner);
@@ -839,7 +1132,13 @@ function renderPlayerView(view) {
 
   const title = document.createElement('div');
   title.className = 'boardTitle';
-  title.innerHTML = `<strong>你的棋盘（${sideName(view.side)}）</strong><span class="pill">${view.phase === 'deploy' ? '点格子移动间' : '点格子移动捕'}</span>`;
+  const boardHint = (ph) => {
+    if (ph === 'deploy_move') return '点格子移动间谍';
+    if (ph === 'hunt_move') return '点格子移动追捕者';
+    if (ph === 'deploy_card' || ph === 'hunt_card') return '出牌或跳过出牌';
+    return '';
+  };
+  title.innerHTML = `<strong>你的棋盘（${sideName(view.side)}）</strong><span class="pill">${boardHint(view.phase)}</span>`;
   boardBox.appendChild(title);
 
   const boardRoot = document.createElement('div');
@@ -847,11 +1146,11 @@ function renderPlayerView(view) {
 
   const side = view.side;
   const phase = view.phase;
-  const piece = (phase === 'deploy') ? 'spy' : 'hunter';
+  const piece = (phase === 'deploy_move') ? 'spy' : (phase === 'hunt_move' ? 'hunter' : null);
   const moved = (view.movesThisPhase && view.movesThisPhase[side]) ? view.movesThisPhase[side] : 0;
   const frozen = (view.self && view.self.frozenRounds) ? view.self.frozenRounds : 0;
   const started = !!view.started;
-  let canAct = started && (!isOver) && (moved < 1) && (frozen <= 0);
+  let canAct = started && (!isOver) && (moved < 1) && (frozen <= 0) && (piece !== null);
   if (canAct && piece === 'hunter' && !view.self.spyPos) canAct = false;
 
   const legal = new Set();
@@ -988,7 +1287,8 @@ function renderPlayerView(view) {
   head.style.display = 'flex';
   head.style.alignItems = 'center';
   head.style.justifyContent = 'space-between';
-  head.innerHTML = `<strong>你的锦囊</strong><span class="muted">本阶段已用锦囊：${view.cardsUsedThisPhase[view.side] ? '是' : '否'}</span>`;
+  const decided = (view.cardDecisionThisPhase && view.cardDecisionThisPhase[view.side]) ? true : false;
+  head.innerHTML = `<strong>你的锦囊</strong><span class="muted">本阶段已出牌：${view.cardsUsedThisPhase[view.side] ? '是' : (decided ? '已跳过' : '否')}</span>`;
   cards.appendChild(head);
 
   if (!lines.length) {
@@ -1009,8 +1309,8 @@ function renderPlayerView(view) {
       b.textContent = `${it.name} × ${it.n}`;
       // 阶段限制：部署卡/追捕卡
       const isDeployCard = (it.name === '差役成群' || it.name === '幽径暗道');
-      const phaseOk = (view.phase === 'deploy') ? isDeployCard : !isDeployCard;
-      b.disabled = view.cardsUsedThisPhase[view.side] || !phaseOk;
+      const phaseOk = (view.phase === 'deploy_card') ? isDeployCard : (view.phase === 'hunt_card') ? !isDeployCard : false;
+      b.disabled = decided || view.cardsUsedThisPhase[view.side] || !phaseOk;
 
       b.onclick = () => {
         // 参照最早裁判版：耳目线报需要方向输入，并可选发动隐藏效果【拿钱办事】
@@ -1024,11 +1324,10 @@ function renderPlayerView(view) {
           if (!hasAlms) {
             const want = confirm('是否发动隐藏效果【拿钱办事】？\n确定：额外弃置 1 张其它卡牌，获得【丐帮情报网络】（后续耳目可侦查整条线）。');
             if (want) {
-              // 可弃置候选：除“耳目线报”外且数量>0
+              // 可弃置候选：任意卡牌数量>0；若弃置“耳目线报”本身，需要至少 2 张（因为本次使用也会消耗 1 张）
               const candidates = baseCardOrder
-                .filter(n => n !== '耳目线报')
                 .map(n => ({ name: n, n: (view.self.cards?.[n] || 0) }))
-                .filter(x => x.n > 0);
+                .filter(x => (x.name === '耳目线报') ? (x.n >= 2) : (x.n > 0));
 
               if (candidates.length) {
                 let tip = '选择要弃置的卡牌（输入序号或卡名）：\n';
@@ -1055,7 +1354,7 @@ function renderPlayerView(view) {
                   }
                 }
               } else {
-                toast('你没有其它卡牌可弃置，无法发动【拿钱办事】。');
+                toast('你没有可额外弃置的卡牌（若弃置【耳目线报】需至少 2 张），无法发动【拿钱办事】。');
               }
             }
           }
@@ -1073,6 +1372,18 @@ function renderPlayerView(view) {
     cards.appendChild(list);
   }
 
+  // 出牌阶段：提供“跳过出牌”按钮
+  const inCardPhase = (view.phase === 'deploy_card' || view.phase === 'hunt_card');
+  if (inCardPhase && !decided) {
+    const passBtn = document.createElement('button');
+    passBtn.textContent = '跳过出牌';
+    passBtn.style.marginTop = '10px';
+    passBtn.onclick = () => {
+      send('PASS_CARD', {});
+    };
+    cards.appendChild(passBtn);
+  }
+
   root.appendChild(cards);
 
   return root;
@@ -1084,13 +1395,21 @@ function renderRefView(view) {
   const root = document.createElement('div');
 
   const banner = document.createElement('div');
-  const phaseName = view.truth.phase === 'deploy' ? '部署阶段' : '追捕阶段';
-  banner.className = `phaseBanner ${view.truth.phase === 'deploy' ? 'deploy' : 'chase'}`;
+  const phaseLabel = (p) => {
+    if (p === 'deploy_card') return '部署阶段出牌';
+    if (p === 'deploy_move') return '部署阶段';
+    if (p === 'hunt_card') return '抓捕阶段出牌';
+    if (p === 'hunt_move') return '抓捕阶段';
+    return String(p || '');
+  };
+  const isDeploy = String(view.truth.phase || '').startsWith('deploy');
+  const isCardPhase = (view.truth.phase === 'deploy_card' || view.truth.phase === 'hunt_card');
+  banner.className = `phaseBanner ${isDeploy ? 'deploy' : 'chase'}`;
   banner.innerHTML = `
-    <div class="big">上帝视角 · 回合 ${view.truth.round} · ${phaseName}</div>
+    <div class="big">上帝视角 · 回合 ${view.truth.round} · ${phaseLabel(view.truth.phase)}</div>
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
       <span class="pill">裁判/观众</span>
-      <span class="pill ${view.truth.phase === 'deploy' ? 'phaseDeploy' : 'phaseChase'}">${view.truth.phase === 'deploy' ? '间谍行动' : '追捕行动'}</span>
+      <span class="pill ${isDeploy ? 'phaseDeploy' : 'phaseChase'}">${isCardPhase ? '出牌' : (isDeploy ? '间谍行动' : '追捕行动')}</span>
       <span class="pill" title="差役成群外围走过的格子会高亮">外围已巡逻：蓝色内框</span>
     </div>
   `;
@@ -1239,12 +1558,29 @@ function renderRoom() {
   const logTitle = $('logTitle');
   const logPanel = $('logPanel');
   logPanel.innerHTML = '';
+  const isRefView = (snap.view.kind !== 'player_view');
+  const hideGod = isRefView && !state.showGodView;
   if (snap.view.kind === 'player_view') {
     logTitle.textContent = '你的可见日志';
+    renderLog(logPanel, snap.view.log);
+    // 每条“锦囊/隐藏结算结果”除了写入日志外，还会弹窗提示（更显眼）
+    processResultPopups(snap.view.log);
   } else {
-    logTitle.textContent = '全量日志（裁判/观众可见）';
+    if (hideGod) {
+      // 上帝视角隐藏时：同时隐藏全量日志（避免“只隐藏棋盘但仍看到真相日志”）
+      logTitle.textContent = '日志已隐藏';
+      const tip = document.createElement('div');
+      tip.className = 'muted';
+      tip.style.padding = '10px 6px';
+      tip.textContent = '你已关闭上帝视角显示，日志也已隐藏。勾选“显示上帝视角”后可查看全量日志。';
+      logPanel.appendChild(tip);
+      // 结果弹窗也基于全量日志触发：隐藏上帝视角时不弹出
+    } else {
+      logTitle.textContent = '全量日志（裁判/观众可见）';
+      renderLog(logPanel, snap.view.log);
+      processResultPopups(snap.view.log);
+    }
   }
-  renderLog(logPanel, snap.view.log);
 
   // view
   const viewRoot = $('viewRoot');
@@ -1273,16 +1609,28 @@ function renderRoom() {
 }
 
 function initLanguageToggle() {
-  const sel = document.getElementById('langSelect');
-  if (!sel) return;
+  const wrap = document.getElementById('langToggle');
+  if (!wrap) return;
+
+  const btns = Array.from(wrap.querySelectorAll('[data-lang]'));
+  if (!btns.length) return;
+
+  function setActive(lang) {
+    btns.forEach(b => b.classList.toggle('active', (b.dataset.lang === lang)));
+  }
 
   // 默认值
-  sel.value = state.lang || 'zh-CN';
+  const initial = state.lang || 'zh-CN';
+  setActive(initial);
 
-  sel.addEventListener('change', () => {
-    state.lang = sel.value || 'zh-CN';
-    localStorage.setItem('beiguo_lang', state.lang);
-    applyLanguage();
+  btns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const next = btn.dataset.lang || 'zh-CN';
+      state.lang = next;
+      localStorage.setItem('beiguo_lang', state.lang);
+      setActive(state.lang);
+      applyLanguage();
+    });
   });
 
   // 首次应用
