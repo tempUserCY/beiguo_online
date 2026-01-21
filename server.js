@@ -58,8 +58,11 @@ function uniqNick(desired, takenSet) {
 
 function defaultTruthState() {
   return {
+    // 仅用于裁判/观众视角日志第三方展示（不会下发给对方玩家的私密信息）
+    seatNicks: { A: '', B: '' },
     round: 1,
-    phase: 'deploy', // 'deploy' | 'hunt'
+    // 回合结构：部署出牌 -> 部署移动 -> 抓捕出牌 -> 抓捕移动 -> 下一回合
+    phase: 'deploy_card',
     started: false,
     over: false,
     gameOver: null,
@@ -69,8 +72,10 @@ function defaultTruthState() {
     // 每阶段每方必须至少移动一次（没被宵禁）
     movesThisPhase: { A: 0, B: 0 },
     cardsUsedThisPhase: { A: false, B: false },
-    // 每回合（部署+追捕）每方最多使用 1 次锦囊
+    // 每“大回合”（部署出牌 + 抓捕出牌）每方只能用 1 次锦囊
     cardsUsedThisRound: { A: false, B: false },
+    // 出牌阶段：每方需要做一次“出牌或跳过”的决策（没被宵禁）
+    cardDecisionThisPhase: { A: false, B: false },
 
     A: {
       spyPos: null,
@@ -81,6 +86,10 @@ function defaultTruthState() {
       patrolActive: false,
       patrolRoundsLeft: 0,
       patrolVisitedOuter: [],
+      patrolResolvePending: false,
+      // 差役成群：巡逻撞见提示（延迟到“抓捕阶段结束”再显示）
+      patrolHitPending: false,
+      patrolHitLoc: null,
       // 幽径暗道
       youjingPending: false,
       youjingDiag1: false,
@@ -113,6 +122,10 @@ function defaultTruthState() {
       patrolActive: false,
       patrolRoundsLeft: 0,
       patrolVisitedOuter: [],
+      patrolResolvePending: false,
+      // 差役成群：巡逻撞见提示（延迟到“抓捕阶段结束”再显示）
+      patrolHitPending: false,
+      patrolHitLoc: null,
       youjingPending: false,
       youjingDiag1: false,
       youjingDiag2: false,
@@ -141,8 +154,9 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function addLog(state, { text, vis = 'ALL' }) {
-  state.log.push({ t: nowIso(), vis, text });
+function addLog(state, entry) {
+  const { text, vis = 'ALL', kind = 'LOG', ...rest } = entry || {};
+  state.log.push({ t: nowIso(), vis, kind, text, ...rest });
 }
 
 const BASE_CARDS = ['差役成群', '幽径暗道', '耳目线报', '追猎犬'];
@@ -266,7 +280,12 @@ function applyMove(state, side, piece, to) {
     return { ok: false, err: '本阶段你已经行动过一次。' };
   }
 
-  if (state.phase === 'deploy') {
+  // 出牌阶段不允许移动
+  if (state.phase === 'deploy_card' || state.phase === 'hunt_card') {
+    return { ok: false, err: '当前为出牌阶段，不能移动棋子。' };
+  }
+
+  if (state.phase === 'deploy_move') {
     if (piece !== 'spy') return { ok: false, err: '部署阶段只能移动间谍。' };
 
     const from = p.spyPos;
@@ -295,13 +314,13 @@ function applyMove(state, side, piece, to) {
         }
         if (p.youjingDiag1 && p.youjingDiag2 && !p.hidden.undergroundNetwork) {
           p.hidden.undergroundNetwork = true;
-          addLog(state, { text: `R${state.round} · 隐藏：你完成 X 形穿越，触发【地下网络】！`, vis: side });
-          addLog(state, { text: `R${state.round} · 隐藏：${side}方完成 X 形穿越，触发【地下网络】。`, vis: 'REF' });
+          addLog(state, { text: `R${state.round} · 隐藏：你完成 X 形穿越，触发【地下网络】！`, vis: side, kind: 'HIDDEN_RESULT' });
+          addLog(state, { text: `R${state.round} · 隐藏：${side}方完成 X 形穿越，触发【地下网络】。`, vis: 'REF', kind: 'HIDDEN_RESULT' });
         }
 
         state.movesThisPhase[side] += 1;
-        addLog(state, { text: `R${state.round} · 幽径暗道：你完成了一次角到对角穿越。`, vis: side });
-        addLog(state, { text: `R${state.round} · 幽径暗道：${side}方间谍从【${posName(from)}】穿越到【${posName(to)}】。`, vis: 'REF' });
+        addLog(state, { text: `R${state.round} · 幽径暗道：你完成了一次角到对角穿越。`, vis: side, kind: 'CARD_RESULT' });
+        addLog(state, { text: `R${state.round} · 幽径暗道：${side}方间谍从【${posName(from)}】穿越到【${posName(to)}】。`, vis: 'REF', kind: 'CARD_RESULT' });
       } else {
         if (!getAdj4(from, to)) return { ok: false, err: '部署阶段只能十字相邻移动 1 格（除非本回合使用【幽径暗道】从角到对角）。' };
         p.spyPrevPos = { r: from.r, c: from.c };
@@ -317,6 +336,10 @@ function applyMove(state, side, piece, to) {
     // - 记录外围走格
     // - 判断隐藏触发
     // - 记录“巡逻撞见敌方间谍”的日志
+
+    // 猎户直觉（部署阶段触发）与地下网络（敌入四角提示）
+    // 均应在【部署阶段结束】统一判定，确保双方都已更新到“本回合最新位置”，
+    // 避免用到对手尚未行动时的旧 spyPrevPos。
     if (p.patrolActive && p.patrolRoundsLeft > 0) {
 
       // 不间断外围走遍判定（全自动）
@@ -325,23 +348,19 @@ function applyMove(state, side, piece, to) {
         visited.add(outerKey(p.spyPos));
         p.patrolVisitedOuter = [...visited];
 
-        // 外围 8 格全部走遍 -> 触发宵禁令
-        if (visited.size >= 8) {
-          // 撕毁敌方全部锦囊 + 冻结 1 回合
-          for (const k of Object.keys(opp.cards)) opp.cards[k] = 0;
-          opp.frozenRounds = Math.max(opp.frozenRounds, 1);
-          addLog(state, { text: `R${state.round} · 隐藏：你达成【差役成群绕城一圈】，触发【宵禁令】！敌方被冻 1 回合。`, vis: side });
-          addLog(state, { text: `R${state.round} · 隐藏：${side}方触发【宵禁令】，清空敌方锦囊并冻结 1 回合。`, vis: 'REF' });
-          // 触发后结束巡逻
-          p.patrolActive = false;
-          p.patrolRoundsLeft = 0;
+        // 外围 8 格全部走遍（允许跨多张【差役成群】累计） -> 记录“可结算宵禁令”（按新回合结构：在下一次【部署阶段出牌】才结算）
+        if (visited.size >= 8 && !p.patrolResolvePending) {
+          p.patrolResolvePending = true;
+          addLog(state, { text: `R${state.round} · 差役成群：你已完成绕城一圈（宵禁令将于下一次【部署阶段出牌】结算）。`, vis: side, kind: 'CARD_RESULT' });
+          addLog(state, { text: `R${state.round} · 差役成群：${side}方完成绕城一圈（宵禁令待结算）。`, vis: 'REF', kind: 'CARD_RESULT' });
         }
       }
 
       // 巡逻撞见敌方间谍（仅日志）
       if (posEq(p.spyPos, opp.spyPos)) {
-        addLog(state, { text: `R${state.round} · 差役成群：巡逻中撞见敌方间谍所在格！`, vis: side });
-        addLog(state, { text: `R${state.round} · 差役成群：${side}方巡逻中撞见敌方间谍。`, vis: 'REF' });
+        // 注意：提示延迟到“抓捕阶段结束”再显示（避免部署阶段直接暴露）
+        p.patrolHitPending = true;
+        p.patrolHitLoc = posName(p.spyPos);
       }
 
       // 巡逻自然结束：由回合结算（ADVANCE_PHASE 进入下一回合）统一处理
@@ -350,20 +369,17 @@ function applyMove(state, side, piece, to) {
     // 差役成群 BUG 修复：若对手正处于巡逻状态，而我方间谍后来进入/部署到相同格子，
     // 需要让对手也能“撞见”敌方（否则会因先结算导致漏判）。
     if (!p.patrolActive && opp.patrolActive && opp.patrolRoundsLeft > 0 && posEq(p.spyPos, opp.spyPos)) {
-      addLog(state, { text: `R${state.round} · 差役成群：巡逻中撞见敌方间谍所在格！`, vis: oppSide });
-      addLog(state, { text: `R${state.round} · 差役成群：${oppSide}方巡逻中撞见敌方间谍（由敌方后进入触发）。`, vis: 'REF' });
+      // 同样延迟提示到“抓捕阶段结束”
+      opp.patrolHitPending = true;
+      opp.patrolHitLoc = posName(opp.spyPos);
     }
 
-    // 地下网络：如果对手拥有地下网络，而我方间谍进入四角 -> 通知对手
-    if (opp.hidden.undergroundNetwork && isCorner(p.spyPos)) {
-      addLog(state, { text: `R${state.round} · 地下网络：你得知敌方出现在四角之一。`, vis: oppSide });
-      addLog(state, { text: `R${state.round} · 地下网络：${oppSide}方得知敌方进入四角。`, vis: 'REF' });
-    }
+    // 地下网络提示同上：延后到部署阶段结束统一判定。
 
     return { ok: true };
   }
 
-  // hunt phase
+  // hunt move phase
   if (piece !== 'hunter') return { ok: false, err: '追捕阶段只能部署/移动追捕者。' };
   if (!p.spyPos) return { ok: false, err: '你尚未部署间谍，无法追捕。' };
 
@@ -378,11 +394,8 @@ function applyMove(state, side, piece, to) {
   addLog(state, { text: `R${state.round} · 追捕：你移动了追捕者。`, vis: side });
   addLog(state, { text: `R${state.round} · 追捕：${side}方追捕者移动到【${posName(to)}】。`, vis: 'REF' });
 
-  // 猎户直觉：追捕者走到敌方刚离开的格子
-  if (p.hidden.hunterIntuition && opp.spyPrevPos && posEq(p.hunterPos, opp.spyPrevPos)) {
-    addLog(state, { text: `R${state.round} · 猎户直觉：你感知到敌方刚刚离开这里！`, vis: side });
-    addLog(state, { text: `R${state.round} · 猎户直觉：${side}方触发提示。`, vis: 'REF' });
-  }
+  // 猎户直觉只与【间谍位置】有关：不在追捕者移动时触发。
+  // 统一在「部署阶段结束 → 进入抓捕阶段卡牌」的结算点判定。
 
   // 抓捕命中：记录待结算（双方都确认后再结算，允许平局）
   if (opp.spyPos && posEq(p.hunterPos, opp.spyPos)) {
@@ -394,6 +407,41 @@ function applyMove(state, side, piece, to) {
   return { ok: true };
 }
 
+// 部署阶段结束统一判定：
+// - 地下网络：敌方“本回合部署结束后”若出现在四角之一，则提示 BUFF 持有者
+// - 猎户直觉：敌方“本回合离开的格子”(spyPrevPos) 与我方“本回合最终间谍位置”(spyPos) 重合，则提示我方
+// 目的：确保双方都已更新到“本回合最新位置”，避免使用对手尚未行动时的旧 spyPrevPos。
+function resolveDeployEndHidden(state) {
+  if (state.phase !== 'deploy_move') return;
+  if (!state.started || state.over) return;
+
+  for (const s of ['A', 'B']) {
+    const p = state[s];
+    const oppSide = s === 'A' ? 'B' : 'A';
+    const opp = state[oppSide];
+
+    // 若对手本回合没有在部署阶段行动（例如被冻结），不要用旧 spyPrevPos/spyPos 做判定
+    if (state.movesThisPhase?.[oppSide] !== 1) {
+      continue;
+    }
+
+    // 地下网络：若我方拥有地下网络，且敌方“本回合部署结束后”出现在四角之一（且确实是本回合进入/部署到该角），提示我方
+    if (p.hidden.undergroundNetwork && opp.spyPos && isCorner(opp.spyPos)) {
+      const enteredThisTurn = !opp.spyPrevPos || !posEq(opp.spyPrevPos, opp.spyPos);
+      if (enteredThisTurn) {
+        addLog(state, { text: `R${state.round} · 地下网络：你得知敌方出现在四角之一。`, vis: s, kind: 'HIDDEN_RESULT' });
+        addLog(state, { text: `R${state.round} · 地下网络：${s}方得知敌方进入四角。`, vis: 'REF', kind: 'HIDDEN_RESULT' });
+      }
+    }
+
+    // 猎户直觉（部署阶段结束）：敌方刚离开的格子 == 我方最终间谍位置
+    if (p.hidden.hunterIntuition && opp.spyPrevPos && p.spyPos && posEq(p.spyPos, opp.spyPrevPos)) {
+      addLog(state, { text: `R${state.round} · 猎户直觉：你感知到敌方刚刚离开这里！`, vis: s, kind: 'HIDDEN_RESULT' });
+      addLog(state, { text: `R${state.round} · 猎户直觉：${s}方触发提示。`, vis: 'REF', kind: 'HIDDEN_RESULT' });
+    }
+  }
+}
+
 function canAdvancePhase(state) {
   if (!state.started) return { ok: false, err: '请等待裁判开始游戏。' };
   if (state.over) return { ok: false, err: '游戏已结束。' };
@@ -401,12 +449,24 @@ function canAdvancePhase(state) {
   const needA = state.A.frozenRounds <= 0;
   const needB = state.B.frozenRounds <= 0;
 
+  // 出牌阶段：双方（未被冻结）需要做一次“出牌或跳过”的决策
+  if (state.phase === 'deploy_card' || state.phase === 'hunt_card') {
+    if ((needA && !state.cardDecisionThisPhase.A) || (needB && !state.cardDecisionThisPhase.B)) {
+      return {
+        ok: false,
+        err: '出牌阶段：所有未被【宵禁令】影响的阵营，都需要选择“出牌”或“跳过出牌”后才能进入下一阶段。'
+      };
+    }
+    return { ok: true };
+  }
+
+  // 移动阶段：双方（未被冻结）必须至少行动一次
   if ((needA && state.movesThisPhase.A === 0) || (needB && state.movesThisPhase.B === 0)) {
     return {
       ok: false,
-      err: state.phase === 'deploy'
+      err: state.phase === 'deploy_move'
         ? '部署阶段：所有未被【宵禁令】影响的阵营，都必须至少移动一次间谍后才能进入下一阶段。'
-        : '追捕阶段：所有未被【宵禁令】影响的阵营，都必须至少部署/移动一次追捕者后才能进入下一阶段。'
+        : '抓捕阶段：所有未被【宵禁令】影响的阵营，都必须至少部署/移动一次追捕者后才能进入下一阶段。'
     };
   }
   return { ok: true };
@@ -418,19 +478,44 @@ function advancePhase(state) {
 
   if (state.over) return { ok: true };
 
-  // 清理阶段计数
-  state.cardsUsedThisPhase.A = false;
-  state.cardsUsedThisPhase.B = false;
-  state.movesThisPhase.A = 0;
-  state.movesThisPhase.B = 0;
 
-  if (state.phase === 'deploy') {
-    state.phase = 'hunt';
-    // 进入追捕阶段时清空待结算抓捕标记
+  // --- phase transitions ---
+  if (state.phase === 'deploy_card') {
+    // 进入部署移动：重置移动计数
+    state.movesThisPhase.A = 0;
+    state.movesThisPhase.B = 0;
+    state.phase = 'deploy_move';
+    addLog(state, { text: `R${state.round} · 阶段切换：进入【部署阶段】。`, vis: 'ALL' });
+    return { ok: true };
+  }
+
+  if (state.phase === 'deploy_move') {
+    // 部署阶段结束：先统一结算需要“等双方都部署完最新位置”才能判定的隐藏效果
+    resolveDeployEndHidden(state);
+
+    // 进入抓捕出牌：重置出牌决策
+    state.cardsUsedThisPhase.A = false;
+    state.cardsUsedThisPhase.B = false;
+    state.cardDecisionThisPhase.A = false;
+    state.cardDecisionThisPhase.B = false;
+    state.phase = 'hunt_card';
+    addLog(state, { text: `R${state.round} · 阶段切换：进入【抓捕阶段出牌】。`, vis: 'ALL' });
+    return { ok: true };
+  }
+
+  if (state.phase === 'hunt_card') {
+    // 进入抓捕移动：清空待结算抓捕标记 & 重置移动计数
     state.pendingCapture = { A: false, B: false };
-    addLog(state, { text: `R${state.round} · 阶段切换：从部署阶段进入追捕阶段。`, vis: 'ALL' });
-  } else {
-    // 追捕阶段结束：统一结算抓捕（双方都已“确认/行动”后）
+    state.movesThisPhase.A = 0;
+    state.movesThisPhase.B = 0;
+    state.phase = 'hunt_move';
+    addLog(state, { text: `R${state.round} · 阶段切换：进入【抓捕阶段】。`, vis: 'ALL' });
+    return { ok: true };
+  }
+
+  // hunt_move -> next round deploy_card
+  if (state.phase === 'hunt_move') {
+    // 抓捕阶段结束：统一结算抓捕
     const aHit = !!state.pendingCapture.A;
     const bHit = !!state.pendingCapture.B;
     if (aHit || bHit) {
@@ -449,41 +534,84 @@ function advancePhase(state) {
       }
     }
 
-    // 若已结束，直接返回（不再进入下一回合）
     if (state.over) return { ok: true };
 
-    // 回合结束：追捕者清空、幽径待穿越清空、冻结回合数递减
+    // 差役成群：巡逻“撞见敌方间谍”提示应在【抓捕阶段结束】统一显示
+    for (const s of ['A', 'B']) {
+      const p = state[s];
+      if (p.patrolHitPending) {
+        const loc = p.patrolHitLoc ? `（地点：${p.patrolHitLoc}）` : '';
+        addLog(state, { text: `R${state.round} · 差役成群：巡逻中撞见敌方间谍所在格！${loc}`, vis: s, kind: 'CARD_RESULT' });
+        addLog(state, { text: `R${state.round} · 差役成群：${s}方巡逻中撞见敌方间谍。${loc}`, vis: 'REF', kind: 'CARD_RESULT' });
+        p.patrolHitPending = false;
+        p.patrolHitLoc = null;
+      }
+    }
+
+    // 回合结束清理
     state.A.hunterPos = null;
     state.B.hunterPos = null;
     state.A.youjingPending = false;
     state.B.youjingPending = false;
-
-    // 清空待结算抓捕标记（进入下一回合）
     state.pendingCapture = { A: false, B: false };
 
+    // 冻结回合数递减
     if (state.A.frozenRounds > 0) state.A.frozenRounds -= 1;
     if (state.B.frozenRounds > 0) state.B.frozenRounds -= 1;
 
-    // 差役成群：巡逻回合数递减（回合结束时统一结算）
+    // 差役成群：在下一次【部署阶段出牌】结算宵禁令；这里做回合数递减 + 自然到期
     for (const s of ['A', 'B']) {
       const p = state[s];
       if (p.patrolActive && p.patrolRoundsLeft > 0) {
         p.patrolRoundsLeft -= 1;
         if (p.patrolRoundsLeft <= 0) {
+          // 巡逻到期：结束“带差役”状态，但外围进度允许跨多张【差役成群】累计，
+          // 因此这里不要清空 patrolVisitedOuter / patrolResolvePending。
           p.patrolActive = false;
-          p.patrolVisitedOuter = [];
-          addLog(state, { text: `R${state.round} · 差役成群：${s}方巡逻结束（持续回合到期）。`, vis: 'REF' });
-          addLog(state, { text: `R${state.round} · 差役成群：你的巡逻结束。`, vis: s });
+          addLog(state, { text: `R${state.round} · 差役成群：${s}方巡逻结束（持续回合到期）。`, vis: 'REF', kind: 'CARD_RESULT' });
+          addLog(state, { text: `R${state.round} · 差役成群：你的巡逻结束。`, vis: s, kind: 'CARD_RESULT' });
         }
       }
     }
 
+    // 进入下一回合
     state.round += 1;
-    // 进入新回合时，清空“本回合已用锦囊”标记（部署+追捕共用）
     state.cardsUsedThisRound.A = false;
     state.cardsUsedThisRound.B = false;
-    state.phase = 'deploy';
-    addLog(state, { text: `回合：进入第 ${state.round} 回合（部署阶段）。`, vis: 'ALL' });
+
+    // 进入部署出牌前，处理“差役成群”的延迟结算（若待结算且仍在持续期内）
+    for (const s of ['A', 'B']) {
+      const p = state[s];
+      const oppSide = s === 'A' ? 'B' : 'A';
+      const opp = state[oppSide];
+      // 宵禁令：一旦达成“绕城一圈”，允许跨回合/跨多张差役累计；到下一次【部署阶段出牌】统一结算。
+      // 注意：即使本次差役刚好到期（patrolActive=false），也应当结算。
+      if (p.patrolResolvePending) {
+        // 撕毁敌方全部锦囊 + 冻结 1 回合
+        for (const k of Object.keys(opp.cards)) opp.cards[k] = 0;
+        opp.frozenRounds = Math.max(opp.frozenRounds, 1);
+        addLog(state, { text: `R${state.round} · 隐藏：你达成【差役成群绕城一圈】，触发【宵禁令】！敌方被冻 1 回合。`, vis: s, kind: 'HIDDEN_RESULT' });
+        // 被冻结方也需要得到明确提示（玩家视角会以弹窗 + 日志呈现）
+        addLog(state, { text: `R${state.round} · 隐藏：你遭遇【宵禁令】！你的锦囊被清空并被冻结 1 回合。`, vis: oppSide, kind: 'HIDDEN_RESULT' });
+        addLog(state, { text: `R${state.round} · 隐藏：${s}方触发【宵禁令】，清空敌方锦囊并冻结 1 回合。`, vis: 'REF', kind: 'HIDDEN_RESULT' });
+        // 触发后清空累计进度（并结束巡逻状态）
+        p.patrolActive = false;
+        p.patrolRoundsLeft = 0;
+        p.patrolVisitedOuter = [];
+        p.patrolResolvePending = false;
+      }
+    }
+
+    // 进入新的部署出牌阶段
+    state.cardsUsedThisPhase.A = false;
+    state.cardsUsedThisPhase.B = false;
+    state.cardDecisionThisPhase.A = false;
+    state.cardDecisionThisPhase.B = false;
+    state.movesThisPhase.A = 0;
+    state.movesThisPhase.B = 0;
+    state.phase = 'deploy_card';
+    addLog(state, { text: `回合：进入第 ${state.round} 回合（部署阶段出牌）。`, vis: 'ALL' });
+    return { ok: true };
   }
 
   return { ok: true };
@@ -496,27 +624,32 @@ function applyPlayCard(state, side, cardName, payload) {
   const p = state[side];
   if (p.frozenRounds > 0) return { ok: false, err: '你已被【宵禁令】冻结，本回合无法行动。' };
 
-  // 一回合=部署+追捕：同一回合内只能使用一次锦囊
-  if (state.cardsUsedThisRound[side]) {
-    return { ok: false, err: '本回合你已经使用过锦囊（部署+追捕合计一次）。' };
+  // 跨两个出牌阶段的“大回合”限制：每回合只能用 1 次锦囊
+  if (state.cardsUsedThisRound?.[side]) {
+    return { ok: false, err: '本回合你已经使用过锦囊。' };
   }
 
   if (state.cardsUsedThisPhase[side]) {
     return { ok: false, err: '本阶段你已经使用过锦囊。' };
   }
 
+  // 只能在出牌阶段使用锦囊
+  if (state.phase !== 'deploy_card' && state.phase !== 'hunt_card') {
+    return { ok: false, err: '当前不是出牌阶段，不能使用锦囊。' };
+  }
+
   if (!BASE_CARDS.includes(cardName)) {
     return { ok: false, err: '非法锦囊名称（本体包仅：差役成群 / 幽径暗道 / 耳目线报 / 追猎犬）。' };
   }
 
-  // 阶段限制：部署卡/追捕卡只能在对应阶段使用
+  // 阶段限制：部署出牌/抓捕出牌
   const deployCards = new Set(['差役成群', '幽径暗道']);
   const huntCards = new Set(['耳目线报', '追猎犬']);
-  if (state.phase === 'deploy' && !deployCards.has(cardName)) {
-    return { ok: false, err: '当前为部署阶段，只能使用【差役成群 / 幽径暗道】。' };
+  if (state.phase === 'deploy_card' && !deployCards.has(cardName)) {
+    return { ok: false, err: '当前为【部署阶段出牌】，只能使用【差役成群 / 幽径暗道】。' };
   }
-  if (state.phase === 'hunt' && !huntCards.has(cardName)) {
-    return { ok: false, err: '当前为追捕阶段，只能使用【耳目线报 / 追猎犬】。' };
+  if (state.phase === 'hunt_card' && !huntCards.has(cardName)) {
+    return { ok: false, err: '当前为【抓捕阶段出牌】，只能使用【耳目线报 / 追猎犬】。' };
   }
 
   if (!p.cards[cardName] || p.cards[cardName] <= 0) {
@@ -539,9 +672,9 @@ function applyPlayCard(state, side, cardName, payload) {
     p.cards[cardName] -= 1;
     state.cardsUsedThisPhase[side] = true;
     state.cardsUsedThisRound[side] = true;
+    state.cardDecisionThisPhase[side] = true;
 
-    // 若之前巡逻已断（patrolActive=false），则从头记录外围走格（不间断要求）
-    if (!p.patrolActive) p.patrolVisitedOuter = [];
+    // 外围巡逻进度允许跨多张【差役成群】累计（用于触发【宵禁令】），因此不在这里清空。
     p.patrolActive = true;
     p.patrolRoundsLeft = 3;
 
@@ -558,6 +691,7 @@ function applyPlayCard(state, side, cardName, payload) {
     p.cards[cardName] -= 1;
     state.cardsUsedThisPhase[side] = true;
     state.cardsUsedThisRound[side] = true;
+    state.cardDecisionThisPhase[side] = true;
     p.youjingPending = true;
 
     addLog(state, { text: `R${state.round} · 锦囊：你在角上发动【幽径暗道】，本回合下一次间谍移动可从当前角穿越到对角角。`, vis: side });
@@ -584,21 +718,33 @@ function applyPlayCard(state, side, cardName, payload) {
       const discardName = String(pl.discardCard ?? '').trim();
       if (!discardName) {
         // 不强制失败：只是不发动隐藏效果
-      } else if (discardName === '耳目线报') {
-        // 不允许弃本次使用的牌
-      } else if ((p.cards[discardName] || 0) <= 0) {
-        // 无此牌
       } else {
-        p.cards[discardName] -= 1;
-        p.hidden.almsNetwork = true;
-        activatedAlms = true;
-        discarded = discardName;
+        const have = p.cards[discardName] || 0;
+        // 允许弃置“耳目线报”本身，但需要额外持有 1 张（因为本次使用也会消耗 1 张）
+        if (discardName === cardName) {
+          if (have <= 1) {
+            // 张数不足，无法同时“使用+额外弃置”
+          } else {
+            p.cards[discardName] -= 1;
+            p.hidden.almsNetwork = true;
+            activatedAlms = true;
+            discarded = discardName;
+          }
+        } else if (have <= 0) {
+        // 无此牌
+        } else {
+          p.cards[discardName] -= 1;
+          p.hidden.almsNetwork = true;
+          activatedAlms = true;
+          discarded = discardName;
+        }
       }
     }
 
     p.cards[cardName] -= 1;
     state.cardsUsedThisPhase[side] = true;
     state.cardsUsedThisRound[side] = true;
+    state.cardDecisionThisPhase[side] = true;
 
     const v = dirMap[dir];
     const origin = p.spyPos;
@@ -629,19 +775,25 @@ function applyPlayCard(state, side, cardName, payload) {
 
     const found = cells.some(pos => posEq(pos, opp.spyPos));
 
-    if (p.hidden.almsNetwork) {
-      addLog(state, { text: `R${state.round} · 锦囊：你使用【耳目线报+丐帮情报网络】侦查方向 ${dir} 整条线，结果：${found ? '发现敌方踪迹。' : '未见可疑。'}`, vis: side });
-    } else {
-      addLog(state, { text: `R${state.round} · 锦囊：你使用【耳目线报】侦查方向 ${dir} 前方，结果：${found ? '前方线路存在敌方踪迹。' : '前方未发现敌人。'}`, vis: side });
-    }
-
+    // 顺序要求：若发动【拿钱办事】，应先提示“发动隐藏效果”，再提示耳目判定结果（日志与弹窗都要同顺序）
     if (activatedAlms) {
       // 玩家侧不暴露弃置具体牌名（你要求“手牌只给裁判”）
-      addLog(state, { text: `R${state.round} · 隐藏：你额外弃置 1 张卡牌发动【拿钱办事】，获得【丐帮情报网络】。`, vis: side });
-      addLog(state, { text: `R${state.round} · 隐藏：${side}方弃置【${discarded}】发动【拿钱办事】，获得【丐帮情报网络】。`, vis: 'REF' });
+      addLog(state, { text: `R${state.round} · 隐藏：你额外弃置 1 张卡牌发动【拿钱办事】，获得【丐帮情报网络】。`, vis: side, kind: 'HIDDEN_RESULT' });
+      addLog(state, { text: `R${state.round} · 隐藏：${side}方弃置【${discarded}】发动【拿钱办事】，获得【丐帮情报网络】。`, vis: 'REF', kind: 'HIDDEN_RESULT' });
     }
 
-    addLog(state, { text: `R${state.round} · 锦囊：${side}方使用【耳目线报】 dir=${dir} alms=${p.hidden.almsNetwork} found=${found} payload=${JSON.stringify(pl)}`, vis: 'REF' });
+    if (p.hidden.almsNetwork) {
+      const txt = `R${state.round} · 锦囊：你使用【耳目线报+丐帮情报网络】侦查方向 ${dir} 整条线，结果：${found ? '发现敌方踪迹。' : '未见可疑。'}`;
+      addLog(state, { text: txt, vis: side, kind: 'CARD_RESULT' });
+      // 裁判/观众也需要看到完整判定结果（第三方口吻由 maskForRole 处理）
+      addLog(state, { text: txt, vis: 'REF', kind: 'CARD_RESULT', actor: side });
+    } else {
+      const txt = `R${state.round} · 锦囊：你使用【耳目线报】侦查方向 ${dir} 前方，结果：${found ? '前方线路存在敌方踪迹。' : '前方未发现敌人。'}`;
+      addLog(state, { text: txt, vis: side, kind: 'CARD_RESULT' });
+      addLog(state, { text: txt, vis: 'REF', kind: 'CARD_RESULT', actor: side });
+    }
+
+    // 旧的调试日志移除（避免重复/泄露实现细节）
     return { ok: true };
   }
 
@@ -652,6 +804,7 @@ function applyPlayCard(state, side, cardName, payload) {
     p.cards[cardName] -= 1;
     state.cardsUsedThisPhase[side] = true;
     state.cardsUsedThisRound[side] = true;
+    state.cardDecisionThisPhase[side] = true;
 
     const o = p.spyPos;
     const t = opp.spyPos;
@@ -669,11 +822,13 @@ function applyPlayCard(state, side, cardName, payload) {
       const d1 = dirMain(o, opp.lastYoujingTeleport.from);
       const d2 = dirMain(o, opp.lastYoujingTeleport.to);
       // 玩家侧不透露“对手用了什么牌”，只给出结算结果（两个矛盾方向）
-      addLog(state, { text: `R${state.round} · 锦囊：你使用【追猎犬】，得到两个矛盾方向线索：${d1} 与 ${d2}。`, vis: side });
-      addLog(state, { text: `R${state.round} · 锦囊：${side}方追猎犬受幽径影响，输出 ${d1}/${d2}。`, vis: 'REF' });
+      const txt = `R${state.round} · 锦囊：你使用【追猎犬】，得到两个矛盾方向线索：${d1} 与 ${d2}。`;
+      addLog(state, { text: txt, vis: side, kind: 'CARD_RESULT' });
+      addLog(state, { text: txt, vis: 'REF', kind: 'CARD_RESULT', actor: side });
     } else {
-      addLog(state, { text: `R${state.round} · 锦囊：你使用【追猎犬】，得到线索：敌方大致在你的 ${base} 方。`, vis: side });
-      addLog(state, { text: `R${state.round} · 锦囊：${side}方使用追猎犬，base=${base}。`, vis: 'REF' });
+      const txt = `R${state.round} · 锦囊：你使用【追猎犬】，得到线索：敌方大致在你的 ${base} 方。`;
+      addLog(state, { text: txt, vis: side, kind: 'CARD_RESULT' });
+      addLog(state, { text: txt, vis: 'REF', kind: 'CARD_RESULT', actor: side });
     }
 
     p.lastDogDirections.push(base);
@@ -682,8 +837,8 @@ function applyPlayCard(state, side, cardName, payload) {
     if (p.lastDogDirections.length === 2 && p.lastDogDirections[0] === p.lastDogDirections[1]) {
       if (!p.hidden.hunterIntuition) {
         p.hidden.hunterIntuition = true;
-        addLog(state, { text: `R${state.round} · 隐藏：你的追猎犬连续两次指向同一方向，触发【猎户直觉】。`, vis: side });
-        addLog(state, { text: `R${state.round} · 隐藏：${side}方触发【猎户直觉】。`, vis: 'REF' });
+        addLog(state, { text: `R${state.round} · 隐藏：你的追猎犬连续两次指向同一方向，触发【猎户直觉】。`, vis: side, kind: 'HIDDEN_RESULT' });
+        addLog(state, { text: `R${state.round} · 隐藏：${side}方触发【猎户直觉】。`, vis: 'REF', kind: 'HIDDEN_RESULT' });
       }
     }
 
@@ -693,14 +848,68 @@ function applyPlayCard(state, side, cardName, payload) {
   return { ok: false, err: '未实现的锦囊。' };
 }
 
+function applyPassCard(state, side) {
+  if (!state.started) return { ok: false, err: '请等待裁判开始游戏。' };
+  if (state.over) return { ok: false, err: '游戏已结束。' };
+  if (side !== 'A' && side !== 'B') return { ok: false, err: '非法阵营。' };
+  const p = state[side];
+  if (p.frozenRounds > 0) return { ok: false, err: '你已被【宵禁令】冻结，本回合无法行动。' };
+  if (state.phase !== 'deploy_card' && state.phase !== 'hunt_card') {
+    return { ok: false, err: '当前不是出牌阶段，不能跳过。' };
+  }
+  if (state.cardDecisionThisPhase[side]) {
+    return { ok: false, err: '本阶段你已经做出过出牌决策。' };
+  }
+  state.cardDecisionThisPhase[side] = true;
+  addLog(state, { text: `R${state.round} · 出牌：你选择跳过出牌。`, vis: side });
+  addLog(state, { text: `R${state.round} · 出牌：${side}方选择跳过出牌。`, vis: 'REF' });
+  return { ok: true };
+}
+
 function maskForRole(state, role, seat) {
   // seat: 'A'|'B'|null
   // role: 'REF'|'SPECTATOR'|'A'|'B'
   if (role === 'REF' || role === 'SPECTATOR') {
+    const nickA = state?.seatNicks?.A || '';
+    const nickB = state?.seatNicks?.B || '';
+    const label = (side) => {
+      if (side === 'A') return nickA ? `大宋方(${nickA})` : '大宋方';
+      if (side === 'B') return nickB ? `契丹方(${nickB})` : '契丹方';
+      return '玩家';
+    };
+
+    const toSideNamesForRef = (s) => {
+      if (!s) return s;
+      // 将裁判/观众视角中的 A/B 统一替换为 大宋/契丹，并尽可能带上昵称。
+      // 只对 REF/ALL 日志做替换：避免出现玩家私密日志里“你”的口吻。
+      return String(s)
+        // 先把 A/B 方替换掉
+        .replaceAll('A方', label('A'))
+        .replaceAll('B方', label('B'))
+        .replaceAll('A 方', nickA ? `大宋(${nickA})` : '大宋')
+        .replaceAll('B 方', nickB ? `契丹(${nickB})` : '契丹')
+        .replaceAll('：A', nickA ? `：大宋(${nickA})` : '：大宋')
+        .replaceAll('：B', nickB ? `：契丹(${nickB})` : '：契丹');
+    };
+
+    const thirdPersonize = (e) => {
+      // e.actor 由服务端在 REF 可见的结果日志中写入，用于把“你”替换成具体阵营(昵称)。
+      const actorSide = e?.actor;
+      const actorLabel = label(actorSide);
+      let text = toSideNamesForRef(e.text);
+      if (actorSide === 'A' || actorSide === 'B') {
+        text = String(text).replaceAll('你', actorLabel);
+      }
+      return { ...e, text };
+    };
+
     return {
       kind: 'ref_view',
       truth: state,
+      // 裁判/观众：只看 ALL + REF（第三方口吻），并把 A/B 替换成 大宋/契丹。
       log: state.log
+        .filter(e => e.vis === 'ALL' || e.vis === 'REF')
+        .map(thirdPersonize)
     };
   }
 
@@ -718,7 +927,7 @@ function maskForRole(state, role, seat) {
     gameOver: state.gameOver,
     movesThisPhase: { [side]: state.movesThisPhase[side] },
     cardsUsedThisPhase: { [side]: state.cardsUsedThisPhase[side] },
-    cardsUsedThisRound: { [side]: state.cardsUsedThisRound[side] },
+    cardDecisionThisPhase: { [side]: state.cardDecisionThisPhase[side] },
     self: {
       spyPos: state[side].spyPos,
       hunterPos: state[side].hunterPos,
@@ -758,6 +967,16 @@ function getRoom(code) {
 }
 
 function broadcastRoom(room) {
+  // 维护 seat -> nick 映射，供裁判/观众第三方日志展示
+  const nickOf = (tok) => {
+    if (!tok) return '';
+    return room.clients.get(tok)?.nick || '';
+  };
+  if (room?.state?.seatNicks) {
+    room.state.seatNicks.A = nickOf(room.seats?.A);
+    room.state.seatNicks.B = nickOf(room.seats?.B);
+  }
+
   for (const [token, c] of room.clients.entries()) {
     if (c.ws.readyState !== 1) continue;
 
@@ -837,7 +1056,7 @@ function maybeAutoAdvance(room) {
   if (!room.state || !room.state.started || room.state.over) return;
 
   // 可能连续推进：部署->追捕->新回合（例如双方冻结等极端情况）
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 6; i++) {
     const ok = canAdvancePhase(room.state);
     if (!ok.ok) break;
     const res = advancePhase(room.state);
@@ -1205,6 +1424,29 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    if (type === 'PASS_CARD') {
+      if (!room.state.started) {
+        send(ws, { type: 'ERROR', message: hasJudge(room) ? '请等待裁判开始游戏。' : '请等待房主开始游戏。' });
+        return;
+      }
+      if (client.role !== 'A' && client.role !== 'B') {
+        send(ws, { type: 'ERROR', message: '只有玩家可以跳过出牌。' });
+        return;
+      }
+      const side = client.role;
+      const res = applyPassCard(room.state, side);
+      if (!res.ok) {
+        send(ws, { type: 'ERROR', message: res.err });
+        return;
+      }
+      broadcastRoom(room);
+      const before = room.state.round + '|' + room.state.phase;
+      maybeAutoAdvance(room);
+      const after = room.state.round + '|' + room.state.phase;
+      if (before !== after || room.state.over) broadcastRoom(room);
+      return;
+    }
+
     send(ws, { type: 'ERROR', message: `未知消息类型：${type}` });
   });
 
@@ -1215,9 +1457,31 @@ wss.on('connection', (ws) => {
       for (const [token, c] of room.clients.entries()) {
         if (c.ws !== ws) continue;
 
+        // 从在线列表移除
         room.clients.delete(token);
         removedAny = true;
         addLog(room.state, { text: `${c.nick} 离开了房间。`, vis: 'ALL' });
+
+        // --- 裁判掉线/退出：自动切换为“无裁判模式（电脑接管）” ---
+        // 规则：只要 REF token 不在房间里，就认为未分配裁判，从而启用自动推进。
+        const judgeLeft = (room.refToken === token) || (room.seats && room.seats.REF === token);
+        if (room.seats && room.seats.REF === token) room.seats.REF = null;
+        if (room.refToken === token) room.refToken = null;
+        // 给所有人一个明确提示（第三方可见，玩家也可见）
+        if (judgeLeft) {
+          addLog(room.state, { text: `裁判不在线，系统已切换为自动裁判模式。`, vis: 'ALL' });
+        }
+
+        // --- 房主掉线：自动转移给当前房间第一位在线用户 ---
+        if (room.hostToken === token) {
+          const next = room.clients.keys().next();
+          const nextTok = next && !next.done ? next.value : null;
+          room.hostToken = nextTok;
+          if (nextTok) {
+            const nn = room.clients.get(nextTok)?.nick || '（未知）';
+            addLog(room.state, { text: `房主已离线，房主权限自动转移给 ${nn}。`, vis: 'ALL' });
+          }
+        }
       }
       if (removedAny) {
         // 重新计算 role（seat 仍在，但人暂时不在 roster）
@@ -1226,6 +1490,12 @@ wss.on('connection', (ws) => {
           cc.role = rr.role;
           cc.seat = rr.seat;
         }
+
+        // 如果游戏正在进行且现在是无裁判模式，尝试自动推进一次（避免卡在需要裁判推进的阶段）
+        const before = room.state.round + '|' + room.state.phase;
+        maybeAutoAdvance(room);
+        const after = room.state.round + '|' + room.state.phase;
+        // broadcastRoom 下面会再发一次，如果阶段推进发生变化也无所谓
         broadcastRoom(room);
       }
     }
