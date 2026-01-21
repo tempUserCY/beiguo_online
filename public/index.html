@@ -99,6 +99,15 @@
     @media (max-width: 980px){
       .rosterSelect{width:100%}
     }
+
+    /* Language toggle (segmented buttons) */
+    .langToggle{display:inline-flex;align-items:center;border:1px solid #e5e7eb;border-radius:999px;overflow:hidden;background:#fff}
+    .langBtn{border:0;background:transparent;padding:7px 10px;font-size:12px;line-height:1;cursor:pointer;color:#111827}
+    .langBtn + .langBtn{border-left:1px solid #e5e7eb}
+    .langBtn:hover{background:#f3f4f6}
+    .langBtn.active{background:#111827;color:#fff}
+    .langBtn.active:hover{background:#111827}
+
     .toast{position:fixed;right:12px;bottom:12px;max-width:420px;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;display:none}
 
     /* Game over modal */
@@ -118,6 +127,26 @@
     .modalWindow.draw{background:radial-gradient(1000px 300px at 15% 0%, rgba(59,130,246,.35), transparent),
                        radial-gradient(900px 300px at 90% 10%, rgba(168,85,247,.25), transparent),
                        linear-gradient(135deg, rgba(17,24,39,.98), rgba(15,23,42,.98));}
+
+    /* Card result popup (modal) */
+    .eventOverlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(17,24,39,.45);backdrop-filter:blur(2px);z-index:60}
+    .eventOverlay.show{display:flex}
+    .eventWindow{width:min(560px,100%);border-radius:18px;border:1px solid rgba(255,255,255,.18);box-shadow:0 18px 60px rgba(0,0,0,.35);overflow:hidden;transform:translateY(8px);opacity:0;transition:transform .16s ease, opacity .16s ease}
+    .eventOverlay.show .eventWindow{transform:translateY(0);opacity:1}
+    .eventHead{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;background:rgba(255,255,255,.14);color:#fff}
+    .eventTitle{font-weight:900;letter-spacing:.3px;display:flex;align-items:center;gap:8px}
+    .eventBadge{display:inline-block;font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.22);background:rgba(0,0,0,.18)}
+    .eventClose{border:1px solid rgba(255,255,255,.22);background:rgba(0,0,0,.15);color:#fff;border-radius:12px;padding:6px 10px;font-size:13px}
+    .eventBody{padding:14px 16px;color:#fff;font-size:16px;line-height:1.5;white-space:pre-wrap}
+    .eventWindow.card{background:radial-gradient(1100px 320px at 10% 0%, rgba(16,185,129,.45), transparent),
+                      radial-gradient(900px 320px at 90% 10%, rgba(59,130,246,.28), transparent),
+                      linear-gradient(135deg, rgba(15,118,110,.95), rgba(17,24,39,.95));}
+    .eventWindow.hidden{background:radial-gradient(1100px 320px at 10% 0%, rgba(168,85,247,.45), transparent),
+                        radial-gradient(900px 320px at 90% 10%, rgba(236,72,153,.22), transparent),
+                        linear-gradient(135deg, rgba(88,28,135,.95), rgba(17,24,39,.95));}
+    .eventWindow.neutral{background:radial-gradient(1100px 320px at 10% 0%, rgba(245,158,11,.35), transparent),
+                         radial-gradient(900px 320px at 90% 10%, rgba(16,185,129,.18), transparent),
+                         linear-gradient(135deg, rgba(17,24,39,.96), rgba(15,23,42,.96));}
 </style>
   <!-- 简繁转换（OpenCC-JS, UMD） -->
   <script src="https://cdn.jsdelivr.net/npm/opencc-js@1.0.5/dist/umd/full.js"></script>
@@ -127,11 +156,12 @@
     <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
       <h1 style="margin:0">北国密令 · 联机版</h1>
       <div style="display:flex;align-items:center;gap:8px">
-        <span class="muted">语言</span>
-        <select id="langSelect" class="rosterSelect" style="height:34px">
-          <option value="zh-CN">简体</option>
-          <option value="zh-TW">繁體</option>
-        </select>
+        <!-- Language: use explicit buttons (more discoverable than dropdown) -->
+        <div id="langToggle" class="langToggle" role="group" aria-label="Language">
+          <button class="langBtn" type="button" data-lang="en" title="English">EN</button>
+          <button class="langBtn" type="button" data-lang="zh-CN" title="中文（简体）">简</button>
+          <button class="langBtn" type="button" data-lang="zh-TW" title="中文（繁體）">繁</button>
+        </div>
         <span id="godToggleWrap"></span>
       </div>
     </div>
@@ -216,6 +246,17 @@
           <button class="modalClose" id="gameOverModalClose">关闭</button>
         </div>
         <div class="modalBody" id="gameOverModalBody"></div>
+      </div>
+    </div>
+
+    <!-- Card result popup -->
+    <div class="eventOverlay" id="eventModal" aria-hidden="true">
+      <div class="eventWindow neutral" id="eventModalWin" role="dialog" aria-modal="true">
+        <div class="eventHead">
+          <div class="eventTitle"><span id="eventModalIcon">📣</span><span id="eventModalTitle">结算提示</span><span class="eventBadge" id="eventModalBadge">结果</span></div>
+          <button class="eventClose" id="eventModalClose">关闭</button>
+        </div>
+        <div class="eventBody" id="eventModalBody"></div>
       </div>
     </div>
   </div>
